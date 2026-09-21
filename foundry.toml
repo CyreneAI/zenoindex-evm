@@ -1,0 +1,26 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+# No fixed `solc` pin: project files (^0.8.13) build on the latest 0.8.x, while
+# lib/v4-core/src/PoolManager.sol pins exactly 0.8.26 and is auto-selected per file.
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+
+remappings = [
+    "@uniswap/v4-core/=lib/v4-core/",
+    "v4-core/=lib/v4-core/src/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+]
+
+[rpc_endpoints]
+robinhood_testnet = "${RH_RPC_URL}"
+robinhood = "${RH_RPC_URL}"
+
+# Robinhood Chain (Arbitrum Orbit L2)
+#   Testnet chainId 46630 — https://rpc.testnet.chain.robinhood.com
+#   Mainnet  chainId 4663  — https://rpc.mainnet.chain.robinhood.com
+#   Explorers: explorer.testnet.chain.robinhood.com / robinhoodchain.blockscout.com
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
