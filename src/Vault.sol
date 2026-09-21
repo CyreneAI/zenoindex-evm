@@ -2,6 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IZenoIndexVault} from "./interfaces/IZenoIndexVault.sol";
 import {IVault} from "./interfaces/IVault.sol";
 import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
@@ -35,7 +36,7 @@ interface IPriceOracleLike {
 /// @notice ERC-1167 clone implementation — one instance per ETF. Owns all per-vault storage.
 ///         Reads Pricing/Swap_mod addresses and role/asset-registry data live from `zenoIndexVault`
 ///         on every call — never caches them.
-contract Vault is Initializable, IVault {
+contract Vault is Initializable, ReentrancyGuard, IVault {
     enum FundType {
         Fixed,
         Dynamic
@@ -131,9 +132,15 @@ contract Vault is Initializable, IVault {
     error NoPendingWriteOff();
     error NoPendingReactivate();
     error SlotFull();
+    error FeeOutOfBounds();
+    error DuplicateAsset();
+    error AssetReserved();
+    error PathEnd();
 
     modifier onlyManager() {
-        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isOperator(msg.sender)) revert NotVaultManager();
+        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isOperator(msg.sender)) {
+            revert NotVaultManager();
+        }
         _;
     }
 
@@ -162,6 +169,11 @@ contract Vault is Initializable, IVault {
         string calldata name_,
         string calldata symbol_
     ) external initializer {
+        if (depositFeeBps_ > Constants.MAX_DEPOSIT_FEE_BPS) revert FeeOutOfBounds();
+        if (redeemFeeBps_ < Constants.MIN_REDEEM_FEE_BPS || redeemFeeBps_ > Constants.MAX_REDEEM_FEE_BPS) {
+            revert FeeOutOfBounds();
+        }
+
         zenoIndexVault = msg.sender; // ZenoIndexVault.sol is always the one that clones + calls init
         vaultId = vaultId_;
         vaultManager = manager_;
@@ -177,6 +189,9 @@ contract Vault is Initializable, IVault {
 
         uint256 totalBps;
         for (uint256 i = 0; i < n; i++) {
+            for (uint256 j = i + 1; j < n; j++) {
+                if (assetIds[j] == assetIds[i]) revert DuplicateAsset();
+            }
             _assetIds[i] = assetIds[i];
             _allocationBps[i] = allocationBps[i];
             totalBps += allocationBps[i];
@@ -236,10 +251,11 @@ contract Vault is Initializable, IVault {
     // Genesis + Deposit
     // ══════════════════════════════════════════════════════════════════════════
 
-    function genesisDeposit(uint256 baselineSharePrice_) external onlyManager {
+    function genesisDeposit(uint256 baselineSharePrice_) external onlyManager nonReentrant {
         if (genesisDone) revert GenesisAlreadySeeded();
 
-        uint256 genesisShares = VaultMath.calculateReverseGenesisShares(Constants.GENESIS_SEED_USDC, baselineSharePrice_);
+        uint256 genesisShares =
+            VaultMath.calculateReverseGenesisShares(Constants.GENESIS_SEED_USDC, baselineSharePrice_);
         if (maxShares > 0 && genesisShares > maxShares) revert ShareCapExceeded();
 
         baselineSharePrice = baselineSharePrice_;
@@ -256,7 +272,7 @@ contract Vault is Initializable, IVault {
         emit GenesisSeeded(msg.sender, Constants.GENESIS_SEED_USDC, baselineSharePrice_, genesisShares);
     }
 
-    function deposit(uint256 usdcAmount, uint256 minSharesOut) external returns (uint256 sharesMinted) {
+    function deposit(uint256 usdcAmount, uint256 minSharesOut) external nonReentrant returns (uint256 sharesMinted) {
         if (usdcAmount == 0) revert ZeroAmount();
         if (paused) revert VaultPaused();
         if (adminLocked) revert VaultAdminLocked();
@@ -322,7 +338,7 @@ contract Vault is Initializable, IVault {
     // Redeem / claim
     // ══════════════════════════════════════════════════════════════════════════
 
-    function requestRedeem(uint256 shares) external {
+    function requestRedeem(uint256 shares) external nonReentrant {
         if (shares == 0) revert ZeroAmount();
         RedeemState storage rs = redeemStates[msg.sender];
         if (rs.isRedeemActive) revert RedeemAlreadyPending();
@@ -340,8 +356,7 @@ contract Vault is Initializable, IVault {
             freeBalances[i] = bal > _reservedAssets[i] ? bal - _reservedAssets[i] : 0;
         }
 
-        uint256[20] memory amounts =
-            VaultMath.computeRedeemSwapAmounts(freeBalances, n, shares, totalShares_);
+        uint256[20] memory amounts = VaultMath.computeRedeemSwapAmounts(freeBalances, n, shares, totalShares_);
 
         ShareToken(sharesToken).burn(msg.sender, shares);
         totalShares = totalShares_ - shares;
@@ -380,7 +395,7 @@ contract Vault is Initializable, IVault {
         return (rs.assetAmountIn[index], rs.assetSwapped[index]);
     }
 
-    function claim() external {
+    function claim() external nonReentrant {
         RedeemState storage rs = redeemStates[msg.sender];
         if (!rs.isRedeemActive) revert RedeemInactive();
 
@@ -407,18 +422,26 @@ contract Vault is Initializable, IVault {
     // Inflow deployment leg
     // ══════════════════════════════════════════════════════════════════════════
 
-    function swapUsdcToAsset(uint8 assetIndex, address[] calldata path, uint256 minAssetOut) external {
+    function swapUsdcToAsset(uint8 assetIndex, address[] calldata path, uint256 minAssetOut)
+        external
+        onlyManager
+        nonReentrant
+    {
         if (assetIndex >= numAssets) revert InvalidAssetIndex();
         uint256 amount = _usdcTargetAmount[assetIndex];
         if (amount == 0) return;
 
+        (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(_assetIds[assetIndex]);
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
         require(path[0] == usdc, "PATH_START");
+        if (path[path.length - 1] != mint) revert PathEnd();
 
         address swapModAddr = IZenoIndexVault(zenoIndexVault).swapModule();
         address routerAddr = ISwapModLike(swapModAddr).router();
         ERC20Minimal(usdc).approve(routerAddr, amount);
-        uint256 assetOut = ISwapModLike(swapModAddr).executeSwap(path, amount, minAssetOut, address(this), address(this));
+        uint256 assetOut =
+            ISwapModLike(swapModAddr).executeSwap(path, amount, minAssetOut, address(this), address(this));
+        ERC20Minimal(usdc).approve(routerAddr, 0);
 
         totalPendingUsdc = totalPendingUsdc > amount ? totalPendingUsdc - amount : 0;
         _usdcTargetAmount[assetIndex] = 0;
@@ -430,7 +453,7 @@ contract Vault is Initializable, IVault {
     // Redeem unwind leg
     // ══════════════════════════════════════════════════════════════════════════
 
-    function swapAssetToUsdc(uint8 assetIndex, address[] calldata path, uint256 minUsdcOut) external {
+    function swapAssetToUsdc(uint8 assetIndex, address[] calldata path, uint256 minUsdcOut) external nonReentrant {
         RedeemState storage rs = redeemStates[msg.sender];
         if (!rs.isRedeemActive) revert RedeemInactive();
         if (assetIndex >= numAssets) revert InvalidAssetIndex();
@@ -448,6 +471,7 @@ contract Vault is Initializable, IVault {
         ERC20Minimal(mint).approve(routerAddr, assetAmount);
         uint256 usdcOut =
             ISwapModLike(swapModAddr).executeSwap(path, assetAmount, minUsdcOut, address(this), address(this));
+        ERC20Minimal(mint).approve(routerAddr, 0);
 
         redeemUsdcBal[msg.sender] += usdcOut;
         vaultRedeemEscrowTotal += usdcOut;
@@ -474,6 +498,9 @@ contract Vault is Initializable, IVault {
 
         uint256 totalBps;
         for (uint256 i = 0; i < n; i++) {
+            for (uint256 j = i + 1; j < n; j++) {
+                if (assetIds[j] == assetIds[i]) revert DuplicateAsset();
+            }
             totalBps += allocationBps[i];
         }
         if (totalBps != Constants.BPS_DENOM) revert InvalidAllocation();
@@ -524,7 +551,11 @@ contract Vault is Initializable, IVault {
 
     /// @notice Trades ONLY the delta between assetIndex's current NAV weight and its target.
     ///         Skips (no-op) if within Constants.REBALANCE_DRIFT_BPS of target. Manager-only.
-    function executeRebalance(uint8 assetIndex, address[] calldata path, uint256 minOut) external onlyManager {
+    function executeRebalance(uint8 assetIndex, address[] calldata path, uint256 minOut)
+        external
+        onlyManager
+        nonReentrant
+    {
         if (assetIndex >= numAssets) revert InvalidAssetIndex();
 
         uint256 nav = _sumNav();
@@ -548,24 +579,33 @@ contract Vault is Initializable, IVault {
         address routerAddr = ISwapModLike(swapModAddr).router();
 
         if (currentBps > targetBps) {
-            // Overweight: sell the delta (path must end at USDC or the target's mint —
-            // caller decides direct-pair vs USDC-hub via the path they supply).
+            // Overweight: sell the delta down to USDC — path must start at the asset and
+            // end at USDC (a caller-chosen intermediate hub is allowed in between).
             uint256 deltaValueUsdc = ((currentBps - targetBps) * nav) / Constants.BPS_DENOM;
             uint256 sellAmount = currentValueUsdc == 0 ? 0 : (free * deltaValueUsdc) / currentValueUsdc;
             if (sellAmount == 0) return;
             require(path[0] == mint, "PATH_START");
+            if (path[path.length - 1] != usdc) revert PathEnd();
             ERC20Minimal(mint).approve(routerAddr, sellAmount);
             ISwapModLike(swapModAddr).executeSwap(path, sellAmount, minOut, address(this), address(this));
+            ERC20Minimal(mint).approve(routerAddr, 0);
             emit RebalanceExecuted(assetIndex, sellAmount, true);
         } else {
-            // Underweight: buy the delta, funded from free USDC in the vault.
+            // Underweight: buy the delta, funded only from USDC that isn't already earmarked
+            // for another asset's deployment leg (totalPendingUsdc) or owed to redeemers
+            // in escrow (vaultRedeemEscrowTotal) — spending either would leave those
+            // obligations unbacked by real balance.
             uint256 deltaValueUsdc = ((targetBps - currentBps) * nav) / Constants.BPS_DENOM;
-            uint256 usdcFree = ERC20Minimal(usdc).balanceOf(address(this));
+            uint256 usdcBal = ERC20Minimal(usdc).balanceOf(address(this));
+            uint256 earmarked = totalPendingUsdc + vaultRedeemEscrowTotal;
+            uint256 usdcFree = usdcBal > earmarked ? usdcBal - earmarked : 0;
             uint256 buyAmount = deltaValueUsdc < usdcFree ? deltaValueUsdc : usdcFree;
             if (buyAmount == 0) return;
             require(path[0] == usdc, "PATH_START");
+            if (path[path.length - 1] != mint) revert PathEnd();
             ERC20Minimal(usdc).approve(routerAddr, buyAmount);
             ISwapModLike(swapModAddr).executeSwap(path, buyAmount, minOut, address(this), address(this));
+            ERC20Minimal(usdc).approve(routerAddr, 0);
             emit RebalanceExecuted(assetIndex, buyAmount, false);
         }
 
@@ -621,6 +661,11 @@ contract Vault is Initializable, IVault {
         pendingWriteOff[assetId] = false;
 
         uint8 slot = _slotOf(assetId);
+        // A slot with reserved balance has an in-flight redeem leg pinned to this slot
+        // index. Retiring it now (via _retireSlot's compaction) would desync that
+        // redeemer's RedeemState, which is keyed by index — block until the reserved
+        // amount clears (swapAssetToUsdc completes that leg, or the redeemer claims).
+        if (_reservedAssets[slot] > 0) revert AssetReserved();
         (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(assetId);
         uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
         uint256 navContribution;
@@ -690,9 +735,8 @@ contract Vault is Initializable, IVault {
         }
         address pricingAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
         address oracleAddr = _priceOracle();
-        return IPricingLike(pricingAddr).sumNav(
-            zenoIndexVault, oracleAddr, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal
-        );
+        return IPricingLike(pricingAddr)
+            .sumNav(zenoIndexVault, oracleAddr, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
     }
 
     function _priceOracle() internal view returns (address) {

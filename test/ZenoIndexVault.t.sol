@@ -67,6 +67,7 @@ contract ZenoIndexVaultTest is Test {
         zenoIndexVault.setPricingModule(address(pricing));
         zenoIndexVault.setSwapModule(address(swapMod));
         zenoIndexVault.setSwapRouter(address(router));
+        zenoIndexVault.setEtfCreationAuthority(manager);
 
         _initPoolAndSeed(address(usdc), address(tokenA));
         _initPoolAndSeed(address(usdc), address(tokenB));
@@ -178,6 +179,7 @@ contract ZenoIndexVaultTest is Test {
 
         // v was created before the router swap, but reads the CURRENT router live —
         // no re-init needed for the new router to take effect.
+        vm.prank(manager);
         v.swapUsdcToAsset(0, path, 0);
         assertGt(tokenA.balanceOf(address(v)), 0);
     }
@@ -215,8 +217,10 @@ contract ZenoIndexVaultTest is Test {
         address[] memory pathB = new address[](2);
         pathB[0] = address(usdc);
         pathB[1] = address(tokenB);
+        vm.startPrank(manager);
         v.swapUsdcToAsset(0, pathA, 0);
         v.swapUsdcToAsset(1, pathB, 0);
+        vm.stopPrank();
         assertEq(v.usdcTargetAmountAt(0), 0);
         assertEq(v.usdcTargetAmountAt(1), 0);
 
@@ -351,8 +355,10 @@ contract ZenoIndexVaultTest is Test {
         address[] memory pathB = new address[](2);
         pathB[0] = address(usdc);
         pathB[1] = address(tokenB);
+        vm.startPrank(manager);
         v.swapUsdcToAsset(0, pathA, 0);
         v.swapUsdcToAsset(1, pathB, 0);
+        vm.stopPrank();
     }
 
     function test_ExecuteRebalance_OverweightSellChangesBalances() public {
@@ -545,6 +551,7 @@ contract ZenoIndexVaultTest is Test {
         address[] memory pathB = new address[](2);
         pathB[0] = address(usdc);
         pathB[1] = address(tokenB);
+        vm.prank(manager);
         v.swapUsdcToAsset(0, pathB, 0);
         assertEq(v.totalPendingUsdc(), 0);
         assertApproxEqRel(tokenB.balanceOf(address(v)), pendingB, 0.01e18);
@@ -579,5 +586,306 @@ contract ZenoIndexVaultTest is Test {
 
         // Balance is untouched by write-off — tokens remain in the vault's custody.
         assertEq(tokenA.balanceOf(address(v)), balBefore);
+    }
+
+    // ── PRE_MAINNET_REVIEW.md regression tests ──────────────────────────────────
+    // Each test below pins the fix for one Critical/High finding from the pre-mainnet
+    // review so the bug cannot silently come back.
+
+    /// @dev Critical #1: swapUsdcToAsset must reject a path that lands on the wrong
+    ///      output token, and must be manager/operator-gated (not permissionless).
+    function test_SwapUsdcToAsset_RevertsWhenPathEndsOnWrongMint() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        // Slot 0 is assetA (tokenA), but the supplied path routes to tokenB instead.
+        address[] memory wrongPath = new address[](2);
+        wrongPath[0] = address(usdc);
+        wrongPath[1] = address(tokenB);
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.PathEnd.selector);
+        v.swapUsdcToAsset(0, wrongPath, 0);
+    }
+
+    function test_SwapUsdcToAsset_RevertsForNonManager() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        address[] memory path = new address[](2);
+        path[0] = address(usdc);
+        path[1] = address(tokenA);
+
+        vm.prank(user);
+        vm.expectRevert(Vault.NotVaultManager.selector);
+        v.swapUsdcToAsset(0, path, 0);
+    }
+
+    /// @dev Critical #2: an underweight rebalance buy must never spend USDC that is
+    ///      earmarked as totalPendingUsdc or owed to redeemers in escrow.
+    function test_ExecuteRebalance_UnderweightBuyNeverSpendsEscrowedOrPendingUsdc() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        // Put the vault into an active-redeem state so vaultRedeemEscrowTotal > 0, and
+        // leave assetB's slot with real pending USDC (never swapped) so totalPendingUsdc
+        // stays nonzero too — both must be excluded from the rebalance buy's "free" USDC.
+        uint256 depositAmt = 50_000_000;
+        vm.startPrank(user);
+        usdc.approve(address(v), depositAmt);
+        v.deposit(depositAmt, 0);
+        uint256 userShares = ShareToken(v.sharesToken()).balanceOf(user);
+        v.requestRedeem(userShares);
+        vm.stopPrank();
+
+        uint256 pendingBefore = v.totalPendingUsdc();
+        uint256 escrowBefore = v.vaultRedeemEscrowTotal();
+        assertGt(pendingBefore + escrowBefore, 0, "test setup should leave USDC earmarked");
+
+        // Skew target allocations so assetA is underweight and the buy branch fires.
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetB;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 9000;
+        bps[1] = 1000;
+        vm.prank(manager);
+        v.setTargetAllocations(ids, bps);
+
+        address[] memory buyPath = new address[](2);
+        buyPath[0] = address(usdc);
+        buyPath[1] = address(tokenA);
+
+        vm.prank(manager);
+        v.executeRebalance(0, buyPath, 0);
+
+        // The earmarked amounts must be exactly as before — untouched by the buy.
+        assertEq(v.totalPendingUsdc(), pendingBefore, "rebalance must not spend pending USDC");
+        assertEq(v.vaultRedeemEscrowTotal(), escrowBefore, "rebalance must not spend escrowed USDC");
+        assertGe(
+            usdc.balanceOf(address(v)),
+            pendingBefore + escrowBefore,
+            "vault must retain enough USDC to cover pending + escrow"
+        );
+    }
+
+    function test_ExecuteRebalance_RevertsWhenPathEndsOnWrongToken() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetB;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 3000;
+        bps[1] = 7000;
+        vm.prank(manager);
+        v.setTargetAllocations(ids, bps);
+
+        // Overweight sell of A must end at USDC — this path wrongly ends at tokenB.
+        address[] memory badSellPath = new address[](2);
+        badSellPath[0] = address(tokenA);
+        badSellPath[1] = address(tokenB);
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.PathEnd.selector);
+        v.executeRebalance(0, badSellPath, 0);
+    }
+
+    /// @dev Critical #4: deposit/redeem fee bps must be clamped to Constants' bounds at init.
+    function test_CreateVault_RevertsWhenDepositFeeExceedsMax() public {
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetB;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 6000;
+        bps[1] = 4000;
+
+        ZenoIndexVault.CreateVaultParams memory p = ZenoIndexVault.CreateVaultParams({
+            feeRecipient: feeRecipient,
+            depositFeeBps: Constants.MAX_DEPOSIT_FEE_BPS + 1,
+            redeemFeeBps: 50,
+            assetIds: ids,
+            allocationBps: bps,
+            fundType: 1,
+            maxShares: 0,
+            name: "Test Vault",
+            symbol: "tVLT"
+        });
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.FeeOutOfBounds.selector);
+        zenoIndexVault.createVault(p);
+    }
+
+    function test_CreateVault_RevertsWhenRedeemFeeBelowMin() public {
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetB;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 6000;
+        bps[1] = 4000;
+
+        ZenoIndexVault.CreateVaultParams memory p = ZenoIndexVault.CreateVaultParams({
+            feeRecipient: feeRecipient,
+            depositFeeBps: 100,
+            redeemFeeBps: Constants.MIN_REDEEM_FEE_BPS - 1,
+            assetIds: ids,
+            allocationBps: bps,
+            fundType: 1,
+            maxShares: 0,
+            name: "Test Vault",
+            symbol: "tVLT"
+        });
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.FeeOutOfBounds.selector);
+        zenoIndexVault.createVault(p);
+    }
+
+    /// @dev Critical #5: duplicate asset ids must be rejected, both at vault creation and
+    ///      when re-targeting allocations, and createAsset must reject a duplicate mint.
+    function test_CreateVault_RevertsOnDuplicateAssetIds() public {
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetA;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 5000;
+        bps[1] = 5000;
+
+        ZenoIndexVault.CreateVaultParams memory p = ZenoIndexVault.CreateVaultParams({
+            feeRecipient: feeRecipient,
+            depositFeeBps: 100,
+            redeemFeeBps: 50,
+            assetIds: ids,
+            allocationBps: bps,
+            fundType: 1,
+            maxShares: 0,
+            name: "Test Vault",
+            symbol: "tVLT"
+        });
+
+        vm.prank(manager);
+        vm.expectRevert(ZenoIndexVault.AlreadyExists.selector);
+        zenoIndexVault.createVault(p);
+    }
+
+    function test_SetTargetAllocations_RevertsOnDuplicateAssetIds() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetA;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 5000;
+        bps[1] = 5000;
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.DuplicateAsset.selector);
+        v.setTargetAllocations(ids, bps);
+    }
+
+    function test_CreateAsset_RevertsOnDuplicateMint() public {
+        vm.expectRevert(ZenoIndexVault.DuplicateMint.selector);
+        zenoIndexVault.createAsset(address(tokenA));
+    }
+
+    /// @dev Critical #6: write-off must be blocked while the slot has a reserved balance
+    ///      pinned to an in-flight redeem leg, so slot compaction never desyncs RedeemState.
+    function test_ExecuteWriteOff_RevertsWhileAssetIsReservedForActiveRedeem() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        uint256 userShares = ShareToken(v.sharesToken()).balanceOf(address(v)); // genesis shares held by vault itself
+        // Give the user real shares to redeem against deployed assets.
+        uint256 depositAmt = 100_000_000;
+        vm.startPrank(user);
+        usdc.approve(address(v), depositAmt);
+        v.deposit(depositAmt, 0);
+        vm.stopPrank();
+        vm.prank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+
+        uint256 redeemShares = ShareToken(v.sharesToken()).balanceOf(user);
+        vm.prank(user);
+        v.requestRedeem(redeemShares);
+
+        assertGt(v.reservedAt(0), 0, "slot 0 should have a reserved balance from the pending redeem");
+
+        vm.prank(manager);
+        v.proposeWriteOff(assetA);
+
+        vm.expectRevert(Vault.AssetReserved.selector);
+        zenoIndexVault.confirmWriteOff(0, assetA);
+
+        userShares; // silence unused-var warning from the genesis-shares comment above
+    }
+
+    function _pathUsdcTo(address token) internal view returns (address[] memory path) {
+        path = new address[](2);
+        path[0] = address(usdc);
+        path[1] = token;
+    }
+
+    /// @dev High: createVault must require etfCreationAuthority to be set — an unset gate
+    ///      previously let anyone create a vault.
+    function test_CreateVault_RevertsWhenCreationGateUnset() public {
+        ZenoIndexVault freshFactory = new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(oracle));
+        freshFactory.setPricingModule(address(pricing));
+
+        uint64[] memory ids = new uint64[](1);
+        ids[0] = freshFactory.createAsset(address(tokenA));
+        uint16[] memory bps = new uint16[](1);
+        bps[0] = 10_000;
+
+        ZenoIndexVault.CreateVaultParams memory p = ZenoIndexVault.CreateVaultParams({
+            feeRecipient: feeRecipient,
+            depositFeeBps: 100,
+            redeemFeeBps: 50,
+            assetIds: ids,
+            allocationBps: bps,
+            fundType: 1,
+            maxShares: 0,
+            name: "Test Vault",
+            symbol: "tVLT"
+        });
+
+        vm.expectRevert(ZenoIndexVault.CreationGateNotSet.selector);
+        freshFactory.createVault(p);
+    }
+
+    /// @dev High: the oracle can never be the zero address, and super-admin can rotate it.
+    function test_Constructor_RevertsOnZeroPriceOracle() public {
+        vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
+        new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(0));
+    }
+
+    function test_SetPriceOracle_RotatesOracleAndRejectsZero() public {
+        MockPriceOracle newOracle = new MockPriceOracle();
+        zenoIndexVault.setPriceOracle(address(newOracle));
+        assertEq(zenoIndexVault.priceOracle(), address(newOracle));
+
+        vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
+        zenoIndexVault.setPriceOracle(address(0));
+
+        vm.prank(user);
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.setPriceOracle(address(oracle));
+    }
+
+    /// @dev High: the router allowance must be reset to 0 after every swap, so a router
+    ///      that pulls less than the approved amount cannot later be re-drawn on.
+    function test_SwapUsdcToAsset_ZeroesRouterAllowanceAfterSwap() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        vm.prank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+
+        assertEq(usdc.allowance(address(v), address(router)), 0, "USDC allowance to router must be zeroed after swap");
     }
 }

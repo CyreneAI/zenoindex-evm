@@ -54,6 +54,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     // ── Asset registry ────────────────────────────────────────────────────────
     mapping(uint64 => AssetInfo) internal _assets;
     uint64 public totalAssets;
+    mapping(address => bool) internal _mintRegistered;
 
     // ── Vault (clone) registry ────────────────────────────────────────────────
     uint64 public totalVaults;
@@ -73,6 +74,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     event VaultCreated(uint64 indexed vaultId, address indexed clone, address manager);
     event WriteOffConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
     event ReactivateConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
+    event PriceOracleSet(address indexed oracle);
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error NotSuperAdmin();
@@ -86,6 +88,8 @@ contract ZenoIndexVault is IZenoIndexVault {
     error InvalidAllocation();
     error UnauthorizedGateAuthority();
     error VaultNotFound();
+    error CreationGateNotSet();
+    error DuplicateMint();
 
     modifier onlySuperAdmin() {
         if (msg.sender != superAdmin) revert NotSuperAdmin();
@@ -93,7 +97,10 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     constructor(address usdcToken_, address treasury_, address vaultImplementation_, address priceOracle_) {
-        if (usdcToken_ == address(0) || treasury_ == address(0) || vaultImplementation_ == address(0)) {
+        if (
+            usdcToken_ == address(0) || treasury_ == address(0) || vaultImplementation_ == address(0)
+                || priceOracle_ == address(0)
+        ) {
             revert ZeroAddress();
         }
         superAdmin = msg.sender;
@@ -140,6 +147,15 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit EtfCreationAuthoritySet(authority);
     }
 
+    /// @notice Rotates the price oracle used for NAV/rebalance valuation. Restricted to
+    ///         super-admin — a compromised or misbehaving oracle can be swapped out without
+    ///         redeploying the factory or any vault clone.
+    function setPriceOracle(address oracle) external onlySuperAdmin {
+        if (oracle == address(0)) revert ZeroAddress();
+        priceOracle = oracle;
+        emit PriceOracleSet(oracle);
+    }
+
     function setPricingModule(address module) external onlySuperAdmin {
         if (module == address(0)) revert ZeroAddress();
         pricingModule = module;
@@ -173,8 +189,10 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     function createAsset(address mint) external onlySuperAdmin returns (uint64 assetId) {
         if (mint == address(0)) revert ZeroAddress();
+        if (_mintRegistered[mint]) revert DuplicateMint();
         assetId = totalAssets;
         _assets[assetId] = AssetInfo({assetId: assetId, mint: mint, active: true, exists: true});
+        _mintRegistered[mint] = true;
         totalAssets = assetId + 1;
         emit AssetCreated(assetId, mint);
     }
@@ -198,7 +216,8 @@ contract ZenoIndexVault is IZenoIndexVault {
         if (isEmergency) revert("EMERGENCY");
 
         address gate = etfCreationAuthority;
-        if (gate != address(0) && msg.sender != gate && msg.sender != superAdmin) {
+        if (gate == address(0)) revert CreationGateNotSet();
+        if (msg.sender != gate && msg.sender != superAdmin) {
             revert UnauthorizedGateAuthority();
         }
 
@@ -210,6 +229,9 @@ contract ZenoIndexVault is IZenoIndexVault {
             AssetInfo storage a = _assets[params.assetIds[i]];
             if (!a.exists) revert AssetMissing();
             if (!a.active) revert AssetInactive();
+            for (uint256 j = i + 1; j < n; j++) {
+                if (params.assetIds[j] == params.assetIds[i]) revert AlreadyExists();
+            }
         }
 
         vaultId = totalVaults;
@@ -217,19 +239,20 @@ contract ZenoIndexVault is IZenoIndexVault {
         vaultClones[vaultId] = clone;
         totalVaults = vaultId + 1;
 
-        IVault(clone).init(
-            vaultId,
-            msg.sender,
-            params.feeRecipient == address(0) ? msg.sender : params.feeRecipient,
-            params.depositFeeBps,
-            params.redeemFeeBps,
-            params.assetIds,
-            params.allocationBps,
-            params.fundType,
-            params.maxShares,
-            params.name,
-            params.symbol
-        );
+        IVault(clone)
+            .init(
+                vaultId,
+                msg.sender,
+                params.feeRecipient == address(0) ? msg.sender : params.feeRecipient,
+                params.depositFeeBps,
+                params.redeemFeeBps,
+                params.assetIds,
+                params.allocationBps,
+                params.fundType,
+                params.maxShares,
+                params.name,
+                params.symbol
+            );
 
         emit VaultCreated(vaultId, clone, msg.sender);
     }
