@@ -19,6 +19,7 @@ interface ISwapModAdmin {
 ///         exactly one place across the whole protocol that answers "who is admin /
 ///         operator" and "where do fees go".
 ///         No `init_global_state` — a real constructor does that job.
+
 contract ZenoIndexVault is IZenoIndexVault {
     // ── Structs ───────────────────────────────────────────────────────────────
     struct CreateVaultParams {
@@ -43,9 +44,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     // ── Admin ─────────────────────────────────────────────────────────────────
     address public accessMaster;
     address public usdcToken;
-    address public priceOracle;
     bool public isEmergency;
-    address public etfCreationAuthority;
 
     // ── Singleton registry ────────────────────────────────────────────────────
     address public vaultImplementation;
@@ -71,7 +70,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     /// @dev Super-admin or any account flagged as an operator on AccessMaster — used for
     ///      asset-registry actions (createAsset / setAssetActive) so operators can add/remove
     ///      assets without needing super-admin's other, more sensitive powers (treasury,
-    ///      emergency, module/oracle rotation, super-admin transfer).
+    ///      emergency, module rotation, super-admin transfer).
     modifier onlySuperAdminOrOperator() {
         IAccessMaster roles = IAccessMaster(accessMaster);
         if (msg.sender != roles.superAdmin() && !roles.isOperator(msg.sender))
@@ -81,7 +80,6 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     // ── Events ────────────────────────────────────────────────────────────────
     event EmergencySet(bool isEmergency);
-    event EtfCreationAuthoritySet(address indexed authority);
     event PricingModuleSet(address indexed module);
     event SwapModuleSet(address indexed module, address indexed router);
     event AssetCreated(uint64 indexed assetId, address mint);
@@ -93,7 +91,6 @@ contract ZenoIndexVault is IZenoIndexVault {
     );
     event WriteOffConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
     event ReactivateConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
-    event PriceOracleSet(address indexed oracle);
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error NotSuperAdmin();
@@ -104,30 +101,17 @@ contract ZenoIndexVault is IZenoIndexVault {
     error NoAssets();
     error TooManyAssets();
     error InvalidAllocation();
-    error UnauthorizedGateAuthority();
     error VaultNotFound();
-    error CreationGateNotSet();
     error DuplicateMint();
 
     // ── Constructor ───────────────────────────────────────────────────────────
-    constructor(
-        address usdcToken_,
-        address vaultImplementation_,
-        address priceOracle_,
-        address accessMaster_
-    ) {
-        if (
-            usdcToken_ == address(0) ||
-            vaultImplementation_ == address(0) ||
-            priceOracle_ == address(0) ||
-            accessMaster_ == address(0)
-        ) {
+    constructor(address usdcToken_, address vaultImplementation_, address accessMaster_) {
+        if (usdcToken_ == address(0) || vaultImplementation_ == address(0) || accessMaster_ == address(0)) {
             revert ZeroAddress();
         }
         accessMaster = accessMaster_;
         usdcToken = usdcToken_;
         vaultImplementation = vaultImplementation_;
-        priceOracle = priceOracle_;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -137,15 +121,6 @@ contract ZenoIndexVault is IZenoIndexVault {
     function setEmergency(bool isEmergency_) external onlySuperAdmin {
         isEmergency = isEmergency_;
         emit EmergencySet(isEmergency_);
-    }
-
-    /// @notice Rotates the price oracle used for NAV/rebalance valuation. Restricted to
-    ///         super-admin — a compromised or misbehaving oracle can be swapped out without
-    ///         redeploying the factory or any vault clone.
-    function setPriceOracle(address oracle) external onlySuperAdmin {
-        if (oracle == address(0)) revert ZeroAddress();
-        priceOracle = oracle;
-        emit PriceOracleSet(oracle);
     }
 
     function setPricingModule(address module) external onlySuperAdmin {
@@ -211,15 +186,6 @@ contract ZenoIndexVault is IZenoIndexVault {
         CreateVaultParams calldata params
     ) external returns (uint64 vaultId) {
         if (isEmergency) revert("EMERGENCY");
-
-        address gate = etfCreationAuthority;
-        if (gate == address(0)) revert CreationGateNotSet();
-        if (
-            msg.sender != gate &&
-            msg.sender != IAccessMaster(accessMaster).superAdmin()
-        ) {
-            revert UnauthorizedGateAuthority();
-        }
 
         uint256 n = params.assetIds.length;
         if (n == 0) revert NoAssets();

@@ -90,7 +90,7 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 |---|---|
 | `constructor(usdcToken_, vaultImplementation_, priceOracle_, accessMaster_)` | Sets registry state + binds `accessMaster` |
 | `superAdmin` / `isOperator` / `treasury` | → `IAccessMaster(accessMaster)` passthrough views |
-| `setEmergency` / `setEtfCreationAuthority` | Super-admin config (`onlySuperAdmin` → `AccessMaster`) |
+| `setEmergency` | Super-admin config (`onlySuperAdmin` → `AccessMaster`) |
 | `setPriceOracle` | Rotates oracle address used by vaults |
 | `setPricingModule` | Stores `NavCalculation` singleton address |
 | `setSwapModule` | Stores `SwapExecutor` singleton address |
@@ -254,7 +254,7 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 | Function | Dependencies / calls |
 |---|---|
-| `superAdmin` / `treasury` / `usdcToken` / `isEmergency` / `pricingModule` / `swapModule` / `priceOracle` / `isOperator` / `etfCreationAuthority` / `getAsset` | Interface only — implemented by `ZenoIndexVault` |
+| `superAdmin` / `treasury` / `usdcToken` / `isEmergency` / `pricingModule` / `swapModule` / `priceOracle` / `isOperator` / `getAsset` | Interface only — implemented by `ZenoIndexVault` |
 
 ---
 

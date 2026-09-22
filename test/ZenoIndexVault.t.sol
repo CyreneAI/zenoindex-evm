@@ -10,7 +10,6 @@ import {AccessMaster} from "../src/AccessMaster.sol";
 import {Constants} from "../src/libraries/Constants.sol";
 import {ShareToken} from "../src/tokens/ShareToken.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
-import {MockPriceOracle} from "../src/mocks/MockPriceOracle.sol";
 import {UniswapV4Adapter} from "../src/adapters/UniswapV4Adapter.sol";
 
 import {PoolManager} from "v4-core/PoolManager.sol";
@@ -29,8 +28,6 @@ contract ZenoIndexVaultTest is Test {
     MockERC20 internal usdc;
     MockERC20 internal tokenA;
     MockERC20 internal tokenB;
-    MockPriceOracle internal oracle;
-
     // Real Uniswap V4 execution venue — swaps go through an actual PoolManager/pool,
     // not a fixed-rate stand-in, so swap outputs below reflect real AMM price impact.
     PoolManager internal poolManager;
@@ -55,8 +52,6 @@ contract ZenoIndexVaultTest is Test {
         usdc = new MockERC20("USD Coin", "USDC", 6);
         tokenA = new MockERC20("Token A", "TKA", 6);
         tokenB = new MockERC20("Token B", "TKB", 6);
-        oracle = new MockPriceOracle();
-
         poolManager = new PoolManager(address(this));
         liquidityRouter = new PoolModifyLiquidityTest(IPoolManager(address(poolManager)));
         router = new UniswapV4Adapter(address(poolManager), dexAdmin);
@@ -64,19 +59,18 @@ contract ZenoIndexVaultTest is Test {
         vaultImpl = new Vault();
         navCalculation = new NavCalculation();
         accessMaster = new AccessMaster(address(this), treasury);
-        zenoIndexVault = new ZenoIndexVault(address(usdc), address(vaultImpl), address(oracle), address(accessMaster));
+        zenoIndexVault = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
         swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
         zenoIndexVault.setPricingModule(address(navCalculation));
         zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(address(router));
-        zenoIndexVault.setEtfCreationAuthority(manager);
 
         _initPoolAndSeed(address(usdc), address(tokenA));
         _initPoolAndSeed(address(usdc), address(tokenB));
 
-        oracle.setPriceWhole(address(tokenA), 1_000_000);
-        oracle.setPriceWhole(address(tokenB), 1_000_000);
+        navCalculation.setPriceWhole(address(tokenA), 1_000_000);
+        navCalculation.setPriceWhole(address(tokenB), 1_000_000);
 
         assetA = zenoIndexVault.createAsset(address(tokenA));
         assetB = zenoIndexVault.createAsset(address(tokenB));
@@ -472,12 +466,12 @@ contract ZenoIndexVaultTest is Test {
         vm.prank(manager);
         v.executeRebalance(1, sellPath, 0);
 
-        // The sell amount is sized off the oracle-priced NAV snapshot, while the real pool
+        // The sell amount is sized off the NavCalculation-priced NAV snapshot, while the real pool
         // fills at a slightly different price — so a single pass can leave sub-lot-size
         // dust rather than an exact zero balance. That dust's value is now far under
         // Constants.REBALANCE_DRIFT_BPS of NAV, so the drift band correctly treats a
         // second pass as a no-op and the slot never auto-retires — an accepted tradeoff
-        // of driving rebalance sizing off oracle price against a live AMM fill.
+        // of driving rebalance sizing off NavCalculation price against a live AMM fill.
         assertLt(tokenB.balanceOf(address(v)), 1000, "wind-down should sell nearly all B");
         assertEq(v.numAssets(), 2, "dust balance keeps the 0% slot from auto-retiring");
 
@@ -974,7 +968,7 @@ contract ZenoIndexVaultTest is Test {
     ///      different slot's redeem leg is still in flight — it should just skip and leave
     ///      the slot in place instead.
     ///
-    ///      Slot 1 (tokenB) is the vault's only funded asset here, so its oracle-priced
+    ///      Slot 1 (tokenB) is the vault's only funded asset here, so its NavCalculation-priced
     ///      value equals the entire NAV and currentBps rounds to exactly BPS_DENOM — the
     ///      sell-delta math (Vault.sol's executeRebalance) then sizes sellAmount == free
     ///      exactly, with no rounding dust, so it reliably clears the whole balance to 0
@@ -1029,57 +1023,27 @@ contract ZenoIndexVaultTest is Test {
         assertEq(v.numAssets(), 2, "auto-retire must skip while a redeem is active, even at zero balance");
     }
 
-    /// @dev High: createVault must require etfCreationAuthority to be set — an unset gate
-    ///      previously let anyone create a vault.
-    function test_CreateVault_RevertsWhenCreationGateUnset() public {
-        AccessMaster freshAccessMaster = new AccessMaster(address(this), treasury);
-        ZenoIndexVault freshFactory =
-            new ZenoIndexVault(address(usdc), address(vaultImpl), address(oracle), address(freshAccessMaster));
-        freshFactory.setPricingModule(address(navCalculation));
-
-        uint64[] memory ids = new uint64[](1);
-        ids[0] = freshFactory.createAsset(address(tokenA));
-        uint16[] memory bps = new uint16[](1);
-        bps[0] = 10_000;
-
-        ZenoIndexVault.CreateVaultParams memory p = ZenoIndexVault.CreateVaultParams({
-            feeRecipient: feeRecipient,
-            depositFeeBps: 100,
-            redeemFeeBps: 50,
-            assetIds: ids,
-            allocationBps: bps,
-            fundType: 1,
-            maxShares: 0,
-            name: "Test Vault",
-            symbol: "tVLT"
-        });
-
-        vm.expectRevert(ZenoIndexVault.CreationGateNotSet.selector);
-        freshFactory.createVault(p);
-    }
-
-    /// @dev High: the oracle can never be the zero address, and super-admin can rotate it.
-    function test_Constructor_RevertsOnZeroPriceOracle() public {
-        vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
-        new ZenoIndexVault(address(usdc), address(vaultImpl), address(0), address(accessMaster));
-    }
-
     function test_Constructor_RevertsOnZeroAccessMaster() public {
         vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
-        new ZenoIndexVault(address(usdc), address(vaultImpl), address(oracle), address(0));
+        new ZenoIndexVault(address(usdc), address(vaultImpl), address(0));
     }
 
-    function test_SetPriceOracle_RotatesOracleAndRejectsZero() public {
-        MockPriceOracle newOracle = new MockPriceOracle();
-        zenoIndexVault.setPriceOracle(address(newOracle));
-        assertEq(zenoIndexVault.priceOracle(), address(newOracle));
 
-        vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
-        zenoIndexVault.setPriceOracle(address(0));
 
-        vm.prank(user);
-        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
-        zenoIndexVault.setPriceOracle(address(oracle));
+    /// @dev Valuation must work with prices set only on NavCalculation.
+    function test_Deposit_UsesNavCalculationPrices() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        uint256 beforeNav = v.totalNav();
+        uint256 depositAmt = 1_000_000e6;
+        vm.startPrank(user);
+        usdc.approve(address(v), depositAmt);
+        uint256 shares = v.deposit(depositAmt, 0);
+        vm.stopPrank();
+
+        assertGt(shares, 0);
+        assertGt(v.totalNav(), beforeNav);
     }
 
     /// @dev High: the router allowance must be reset to 0 after every swap, so a router

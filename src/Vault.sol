@@ -21,16 +21,16 @@ interface ISwapExecutorLike {
 interface INavCalculationLike {
     function sumNav(
         address zenoIndexVaultAddr,
-        address priceOracle,
         address vaultClone,
         uint64[] calldata assetIds,
         uint256[] calldata reservedAmounts,
         uint256 excludeFromUsdcLeg
     ) external view returns (uint256);
-}
 
-interface IPriceOracleLike {
-    function quoteUsdc(address token, uint256 amount) external view returns (uint256);
+    function valueUsdc(address zenoIndexVaultAddr, address token, uint256 amount)
+        external
+        view
+        returns (uint256);
 }
 
 /// @notice ERC-1167 clone implementation — one instance per ETF. Owns all per-vault storage.
@@ -531,9 +531,9 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
         uint256 free = bal > _reservedAssets[assetIndex] ? bal - _reservedAssets[assetIndex] : 0;
 
-        address oracleAddr = _priceOracle();
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        uint256 currentValueUsdc = mint == usdc ? free : IPriceOracleLike(oracleAddr).quoteUsdc(mint, free);
+        address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
+        uint256 currentValueUsdc = INavCalculationLike(navCalculationAddr).valueUsdc(zenoIndexVault, mint, free);
 
         uint256 currentBps = (currentValueUsdc * Constants.BPS_DENOM) / nav;
         uint256 targetBps = _allocationBps[assetIndex];
@@ -614,9 +614,8 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
         uint256 navContribution;
         if (bal > 0) {
-            address oracleAddr = _priceOracle();
-            address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-            navContribution = mint == usdc ? bal : IPriceOracleLike(oracleAddr).quoteUsdc(mint, bal);
+            address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
+            navContribution = INavCalculationLike(navCalculationAddr).valueUsdc(zenoIndexVault, mint, bal);
         }
 
         isWrittenOff[assetId] = true;
@@ -775,13 +774,8 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             reserved[i] = _reservedAssets[i];
         }
         address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
-        address oracleAddr = _priceOracle();
         return INavCalculationLike(navCalculationAddr)
-            .sumNav(zenoIndexVault, oracleAddr, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
-    }
-
-    function _priceOracle() internal view returns (address) {
-        return IZenoIndexVault(zenoIndexVault).priceOracle();
+            .sumNav(zenoIndexVault, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
     }
 
     function _slotOf(uint64 assetId) internal view returns (uint8) {

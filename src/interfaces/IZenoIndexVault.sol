@@ -10,9 +10,7 @@ interface IZenoIndexVault {
     function isEmergency() external view returns (bool);
     function pricingModule() external view returns (address);
     function swapModule() external view returns (address);
-    function priceOracle() external view returns (address);
     function isOperator(address account) external view returns (bool);
-    function etfCreationAuthority() external view returns (address);
 
     /// @return assetId_ The asset's id
     /// @return mint The asset's ERC-20 address
