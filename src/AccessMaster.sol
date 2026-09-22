@@ -18,9 +18,11 @@ import {IAccessMaster} from "./interfaces/IAccessMaster.sol";
 ///         `isOperator()` / `treasury()` below are read-only aliases over that state for the
 ///         vocabulary ZenoIndexVault.sol and Vault.sol already read live via IAccessMaster.
 contract AccessMaster is AccessControl, IAccessMaster {
+    // ── Constants ─────────────────────────────────────────────────────────────
     bytes32 public constant ADMIN_ROLE = DEFAULT_ADMIN_ROLE;
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
 
+    // ── State ─────────────────────────────────────────────────────────────────
     address public treasury;
 
     /// @dev Plain AccessControl has no built-in "who holds this role" enumeration, so the
@@ -28,12 +30,16 @@ contract AccessMaster is AccessControl, IAccessMaster {
     ///      constructor and `setSuperAdmin`, the only two places ADMIN_ROLE is ever granted.
     address private _superAdmin;
 
+    // ── Events ────────────────────────────────────────────────────────────────
     event SuperAdminTransferred(address indexed previousSuperAdmin, address indexed newSuperAdmin);
     event OperatorAdded(address indexed account);
     event OperatorRemoved(address indexed account);
     event TreasuryUpdated(address indexed treasury);
 
+    // ── Errors ────────────────────────────────────────────────────────────────
     error ZeroAddress();
+
+    // ── Constructor ───────────────────────────────────────────────────────────
 
     /// @param initialSuperAdmin The initial ADMIN_ROLE (DEFAULT_ADMIN_ROLE) holder.
     /// @param initialTreasury The initial fee-recipient treasury address.
@@ -46,12 +52,8 @@ contract AccessMaster is AccessControl, IAccessMaster {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Admin (ADMIN_ROLE / DEFAULT_ADMIN_ROLE)
+    // External/public setters
     // ══════════════════════════════════════════════════════════════════════════
-
-    function superAdmin() public view returns (address) {
-        return _superAdmin;
-    }
 
     /// @notice Transfers ADMIN_ROLE to `newSuperAdmin` in one call — no pending step, no
     ///         acceptance required from `newSuperAdmin`. Callable only by the current
@@ -64,14 +66,6 @@ contract AccessMaster is AccessControl, IAccessMaster {
         _revokeRole(ADMIN_ROLE, previous);
         _superAdmin = newSuperAdmin;
         emit SuperAdminTransferred(previous, newSuperAdmin);
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Operators (OPERATOR_ROLE)
-    // ══════════════════════════════════════════════════════════════════════════
-
-    function isOperator(address account) public view returns (bool) {
-        return hasRole(OPERATOR_ROLE, account);
     }
 
     /// @notice Grants OPERATOR_ROLE to `account`. Admin-only.
@@ -87,13 +81,21 @@ contract AccessMaster is AccessControl, IAccessMaster {
         emit OperatorRemoved(account);
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Treasury
-    // ══════════════════════════════════════════════════════════════════════════
-
     function setTreasury(address treasury_) external onlyRole(ADMIN_ROLE) {
         if (treasury_ == address(0)) revert ZeroAddress();
         treasury = treasury_;
         emit TreasuryUpdated(treasury_);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Getters
+    // ══════════════════════════════════════════════════════════════════════════
+
+    function superAdmin() public view returns (address) {
+        return _superAdmin;
+    }
+
+    function isOperator(address account) public view returns (bool) {
+        return hasRole(OPERATOR_ROLE, account);
     }
 }

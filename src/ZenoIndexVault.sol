@@ -20,6 +20,7 @@ interface ISwapModAdmin {
 ///         operator" and "where do fees go".
 ///         No `init_global_state` — a real constructor does that job.
 contract ZenoIndexVault is IZenoIndexVault {
+    // ── Structs ───────────────────────────────────────────────────────────────
     struct CreateVaultParams {
         address feeRecipient; // address(0) -> msg.sender
         uint16 depositFeeBps;
@@ -52,13 +53,29 @@ contract ZenoIndexVault is IZenoIndexVault {
     address public swapModule;
 
     // ── Asset registry ────────────────────────────────────────────────────────
-    mapping(uint64 => AssetInfo) internal _assets;
     uint64 public totalAssets;
+    mapping(uint64 => AssetInfo) internal _assets;
     mapping(address => bool) internal _mintRegistered;
 
     // ── Vault (clone) registry ────────────────────────────────────────────────
     uint64 public totalVaults;
     mapping(uint64 => address) public vaultClones;
+
+    // ── Modifiers ─────────────────────────────────────────────────────────────
+    modifier onlySuperAdmin() {
+        if (msg.sender != IAccessMaster(accessMaster).superAdmin()) revert NotSuperAdmin();
+        _;
+    }
+
+    /// @dev Super-admin or any account flagged as an operator on AccessMaster — used for
+    ///      asset-registry actions (createAsset / setAssetActive) so operators can add/remove
+    ///      assets without needing super-admin's other, more sensitive powers (treasury,
+    ///      emergency, module/oracle rotation, super-admin transfer).
+    modifier onlySuperAdminOrOperator() {
+        IAccessMaster roles = IAccessMaster(accessMaster);
+        if (msg.sender != roles.superAdmin() && !roles.isOperator(msg.sender)) revert NotSuperAdmin();
+        _;
+    }
 
     // ── Events ────────────────────────────────────────────────────────────────
     event EmergencySet(bool isEmergency);
@@ -86,21 +103,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     error CreationGateNotSet();
     error DuplicateMint();
 
-    modifier onlySuperAdmin() {
-        if (msg.sender != IAccessMaster(accessMaster).superAdmin()) revert NotSuperAdmin();
-        _;
-    }
-
-    /// @dev Super-admin or any account flagged as an operator on AccessMaster — used for
-    ///      asset-registry actions (createAsset / setAssetActive) so operators can add/remove
-    ///      assets without needing super-admin's other, more sensitive powers (treasury,
-    ///      emergency, module/oracle rotation, super-admin transfer).
-    modifier onlySuperAdminOrOperator() {
-        IAccessMaster roles = IAccessMaster(accessMaster);
-        if (msg.sender != roles.superAdmin() && !roles.isOperator(msg.sender)) revert NotSuperAdmin();
-        _;
-    }
-
+    // ── Constructor ───────────────────────────────────────────────────────────
     constructor(address usdcToken_, address vaultImplementation_, address priceOracle_, address accessMaster_) {
         if (
             usdcToken_ == address(0) || vaultImplementation_ == address(0) || priceOracle_ == address(0)
@@ -115,23 +118,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Roles + treasury — read live from AccessMaster.sol, never cached (IZenoIndexVault surface)
-    // ══════════════════════════════════════════════════════════════════════════
-
-    function superAdmin() external view returns (address) {
-        return IAccessMaster(accessMaster).superAdmin();
-    }
-
-    function isOperator(address account) external view returns (bool) {
-        return IAccessMaster(accessMaster).isOperator(account);
-    }
-
-    function treasury() external view returns (address) {
-        return IAccessMaster(accessMaster).treasury();
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Admin: config
+    // External/public setters — admin config
     // ══════════════════════════════════════════════════════════════════════════
 
     function setEmergency(bool isEmergency_) external onlySuperAdmin {
@@ -176,7 +163,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Asset registry
+    // External/public setters — asset registry
     // ══════════════════════════════════════════════════════════════════════════
 
     function createAsset(address mint) external onlySuperAdminOrOperator returns (uint64 assetId) {
@@ -198,13 +185,8 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit AssetActiveSet(assetId, active);
     }
 
-    function getAsset(uint64 assetId) external view returns (uint64, address, bool, bool) {
-        AssetInfo storage a = _assets[assetId];
-        return (a.assetId, a.mint, a.active, a.exists);
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
-    // ETF factory
+    // External/public setters — ETF factory
     // ══════════════════════════════════════════════════════════════════════════
 
     function createVault(CreateVaultParams calldata params) external returns (uint64 vaultId) {
@@ -253,7 +235,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Path B relay + emergency-lock relay
+    // External/public setters — Path B relay + emergency-lock relay
     // ══════════════════════════════════════════════════════════════════════════
 
     function confirmWriteOff(uint64 vaultId, uint64 assetId) external onlySuperAdmin {
@@ -274,5 +256,31 @@ contract ZenoIndexVault is IZenoIndexVault {
         address clone = vaultClones[vaultId];
         if (clone == address(0)) revert VaultNotFound();
         Vault(clone).setVaultEmergencyLock(locked);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Getters — roles + treasury, read live from AccessMaster.sol, never cached
+    // (IZenoIndexVault surface)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    function superAdmin() external view returns (address) {
+        return IAccessMaster(accessMaster).superAdmin();
+    }
+
+    function isOperator(address account) external view returns (bool) {
+        return IAccessMaster(accessMaster).isOperator(account);
+    }
+
+    function treasury() external view returns (address) {
+        return IAccessMaster(accessMaster).treasury();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Getters — asset registry
+    // ══════════════════════════════════════════════════════════════════════════
+
+    function getAsset(uint64 assetId) external view returns (uint64, address, bool, bool) {
+        AssetInfo storage a = _assets[assetId];
+        return (a.assetId, a.mint, a.active, a.exists);
     }
 }
