@@ -86,6 +86,7 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     // ── Events ────────────────────────────────────────────────────────────────
     event EmergencySet(bool isEmergency);
+    event UsdcTokenSet(address indexed oldUsdcToken, address indexed newUsdcToken);
     event PriceSet(address indexed token, uint256 usdcOut, uint256 tokenIn);
     event RouterUpdated(address indexed oldRouter, address indexed newRouter);
     event AssetCreated(uint64 indexed assetId, address mint);
@@ -129,6 +130,18 @@ contract ZenoIndexVault is IZenoIndexVault {
     function setEmergency(bool isEmergency_) external onlySuperAdmin {
         isEmergency = isEmergency_;
         emit EmergencySet(isEmergency_);
+    }
+
+    /// @notice Rotates the deposit stablecoin (USDC/USDG) address.
+    /// @dev Every existing vault clone's deposit/redeem/fee accounting and NAV math treats
+    ///      `usdcToken` as a fixed 1:1 peg read live from here — changing it after any vault
+    ///      has live balances desyncs that accounting (old balances are still in the old
+    ///      token). Safe only before `createVault` is ever called, or with full awareness
+    ///      of that consequence.
+    function setUsdcToken(address newUsdcToken) external onlySuperAdmin {
+        if (newUsdcToken == address(0)) revert ZeroAddress();
+        emit UsdcTokenSet(usdcToken, newUsdcToken);
+        usdcToken = newUsdcToken;
     }
 
     /// @notice Sets raw price: `usdcOut` USDC (6 dec) for `tokenIn` raw token units.
