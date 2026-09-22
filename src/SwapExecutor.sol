@@ -6,7 +6,7 @@ import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 /// @notice Singleton swap-execution module, called cross-contract by every Vault.sol clone.
 ///         Holds exactly one piece of state: the currently-registered ISwapRouter/DEX-adapter
 ///         address, settable only by ZenoIndexVault.sol (which gates the call with onlySuperAdmin).
-contract Swap_mod {
+contract SwapExecutor {
     address public zenoIndexVault;
     address public router;
 
@@ -35,14 +35,11 @@ contract Swap_mod {
 
     /// @notice Executes a swap along `path` through the currently-registered router.
     /// @dev `from` (the calling Vault.sol clone) must have approved `router` directly —
-    ///      Swap_mod never custodies the tokens, it only orchestrates the call.
-    function executeSwap(
-        address[] calldata path,
-        uint256 amountIn,
-        uint256 minAmountOut,
-        address from,
-        address to
-    ) external returns (uint256 amountOut) {
+    ///      SwapExecutor never custodies the tokens, it only orchestrates the call.
+    function executeSwap(address[] calldata path, uint256 amountIn, uint256 minAmountOut, address from, address to)
+        external
+        returns (uint256 amountOut)
+    {
         address r = router;
         require(r != address(0), "NO_ROUTER");
         amountOut = ISwapRouter(r).swap(path, amountIn, minAmountOut, from, to);

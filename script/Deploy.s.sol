@@ -5,10 +5,10 @@ import {Script, console2} from "forge-std/Script.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
 import {Pricing} from "../src/Pricing.sol";
-import {Swap_mod} from "../src/Swap_mod.sol";
+import {SwapExecutor} from "../src/SwapExecutor.sol";
 
 /// @notice Production deploy for the clone-factory ZenoIndexVault.
-///         Deploys Vault impl + Pricing + ZenoIndexVault + Swap_mod, then wires
+///         Deploys Vault impl + Pricing + ZenoIndexVault + SwapExecutor, then wires
 ///         an existing stablecoin (USDC or USDG), price oracle, and swap router.
 ///
 /// Required env:
@@ -57,12 +57,11 @@ contract Deploy is Script {
         Vault vaultImpl = new Vault();
         Pricing pricing = new Pricing();
 
-        ZenoIndexVault zenoIndexVault =
-            new ZenoIndexVault(stablecoin, treasury, address(vaultImpl), priceOracle);
-        Swap_mod swapMod = new Swap_mod(address(zenoIndexVault));
+        ZenoIndexVault zenoIndexVault = new ZenoIndexVault(stablecoin, treasury, address(vaultImpl), priceOracle);
+        SwapExecutor swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
         zenoIndexVault.setPricingModule(address(pricing));
-        zenoIndexVault.setSwapModule(address(swapMod));
+        zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(swapRouter);
 
         _registerOptionalAssets(zenoIndexVault);
@@ -73,7 +72,7 @@ contract Deploy is Script {
         console2.log("ZenoIndexVault (factory):", address(zenoIndexVault));
         console2.log("Vault (impl):            ", address(vaultImpl));
         console2.log("Pricing:                 ", address(pricing));
-        console2.log("Swap_mod:                ", address(swapMod));
+        console2.log("SwapExecutor:            ", address(swapExecutor));
         console2.log("superAdmin:", zenoIndexVault.superAdmin());
         console2.log("usdcToken: ", zenoIndexVault.usdcToken());
     }

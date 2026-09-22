@@ -11,7 +11,7 @@ import {ShareToken} from "./tokens/ShareToken.sol";
 import {VaultMath} from "./libraries/VaultMath.sol";
 import {Constants} from "./libraries/Constants.sol";
 
-interface ISwapModLike {
+interface ISwapExecutorLike {
     function router() external view returns (address);
     function executeSwap(address[] calldata path, uint256 amountIn, uint256 minAmountOut, address from, address to)
         external
@@ -34,7 +34,7 @@ interface IPriceOracleLike {
 }
 
 /// @notice ERC-1167 clone implementation — one instance per ETF. Owns all per-vault storage.
-///         Reads Pricing/Swap_mod addresses and role/asset-registry data live from `zenoIndexVault`
+///         Reads Pricing/SwapExecutor addresses and role/asset-registry data live from `zenoIndexVault`
 ///         on every call — never caches them.
 contract Vault is Initializable, ReentrancyGuard, IVault {
     enum FundType {
@@ -445,11 +445,11 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         require(path[0] == usdc, "PATH_START");
         if (path[path.length - 1] != mint) revert PathEnd();
 
-        address swapModAddr = IZenoIndexVault(zenoIndexVault).swapModule();
-        address routerAddr = ISwapModLike(swapModAddr).router();
+        address swapExecutorAddr = IZenoIndexVault(zenoIndexVault).swapModule();
+        address routerAddr = ISwapExecutorLike(swapExecutorAddr).router();
         ERC20Minimal(usdc).approve(routerAddr, amount);
         uint256 assetOut =
-            ISwapModLike(swapModAddr).executeSwap(path, amount, minAssetOut, address(this), address(this));
+            ISwapExecutorLike(swapExecutorAddr).executeSwap(path, amount, minAssetOut, address(this), address(this));
         ERC20Minimal(usdc).approve(routerAddr, 0);
 
         totalPendingUsdc = totalPendingUsdc > amount ? totalPendingUsdc - amount : 0;
@@ -475,11 +475,11 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 assetAmount = rs.assetAmountIn[assetIndex];
         if (assetAmount == 0) revert ZeroAmount();
 
-        address swapModAddr = IZenoIndexVault(zenoIndexVault).swapModule();
-        address routerAddr = ISwapModLike(swapModAddr).router();
+        address swapExecutorAddr = IZenoIndexVault(zenoIndexVault).swapModule();
+        address routerAddr = ISwapExecutorLike(swapExecutorAddr).router();
         ERC20Minimal(mint).approve(routerAddr, assetAmount);
-        uint256 usdcOut =
-            ISwapModLike(swapModAddr).executeSwap(path, assetAmount, minUsdcOut, address(this), address(this));
+        uint256 usdcOut = ISwapExecutorLike(swapExecutorAddr)
+            .executeSwap(path, assetAmount, minUsdcOut, address(this), address(this));
         ERC20Minimal(mint).approve(routerAddr, 0);
 
         redeemUsdcBal[msg.sender] += usdcOut;
@@ -593,8 +593,8 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 driftBps = currentBps > targetBps ? currentBps - targetBps : targetBps - currentBps;
         if (driftBps <= Constants.REBALANCE_DRIFT_BPS) return;
 
-        address swapModAddr = IZenoIndexVault(zenoIndexVault).swapModule();
-        address routerAddr = ISwapModLike(swapModAddr).router();
+        address swapExecutorAddr = IZenoIndexVault(zenoIndexVault).swapModule();
+        address routerAddr = ISwapExecutorLike(swapExecutorAddr).router();
 
         if (currentBps > targetBps) {
             // Overweight: sell the delta down to USDC — path must start at the asset and
@@ -605,7 +605,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             require(path[0] == mint, "PATH_START");
             if (path[path.length - 1] != usdc) revert PathEnd();
             ERC20Minimal(mint).approve(routerAddr, sellAmount);
-            ISwapModLike(swapModAddr).executeSwap(path, sellAmount, minOut, address(this), address(this));
+            ISwapExecutorLike(swapExecutorAddr).executeSwap(path, sellAmount, minOut, address(this), address(this));
             ERC20Minimal(mint).approve(routerAddr, 0);
             emit RebalanceExecuted(assetIndex, sellAmount, true);
         } else {
@@ -622,7 +622,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             require(path[0] == usdc, "PATH_START");
             if (path[path.length - 1] != mint) revert PathEnd();
             ERC20Minimal(usdc).approve(routerAddr, buyAmount);
-            ISwapModLike(swapModAddr).executeSwap(path, buyAmount, minOut, address(this), address(this));
+            ISwapExecutorLike(swapExecutorAddr).executeSwap(path, buyAmount, minOut, address(this), address(this));
             ERC20Minimal(usdc).approve(routerAddr, 0);
             emit RebalanceExecuted(assetIndex, buyAmount, false);
         }

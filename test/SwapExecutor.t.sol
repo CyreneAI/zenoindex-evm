@@ -2,12 +2,12 @@
 pragma solidity ^0.8.13;
 
 import {Test} from "forge-std/Test.sol";
-import {Swap_mod} from "../src/Swap_mod.sol";
+import {SwapExecutor} from "../src/SwapExecutor.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {MockSwapRouter} from "../src/mocks/MockSwapRouter.sol";
 
-contract SwapModTest is Test {
-    Swap_mod internal swapMod;
+contract SwapExecutorTest is Test {
+    SwapExecutor internal swapExecutor;
     MockERC20 internal usdc;
     MockERC20 internal weth;
     MockSwapRouter internal router;
@@ -19,7 +19,7 @@ contract SwapModTest is Test {
         usdc = new MockERC20("USD Coin", "USDC", 6);
         weth = new MockERC20("Wrapped Ether", "WETH", 18);
         router = new MockSwapRouter();
-        swapMod = new Swap_mod(zenoIndexVaultStandIn);
+        swapExecutor = new SwapExecutor(zenoIndexVaultStandIn);
 
         router.setRate(address(usdc), address(weth), 1e6, 1e18);
         weth.mint(address(router), 1_000e18);
@@ -29,12 +29,12 @@ contract SwapModTest is Test {
 
     function test_SetRouter_OnlyZenoIndexVault() public {
         vm.prank(address(0xBAD));
-        vm.expectRevert(Swap_mod.OnlyZenoIndexVault.selector);
-        swapMod.setRouter(address(router));
+        vm.expectRevert(SwapExecutor.OnlyZenoIndexVault.selector);
+        swapExecutor.setRouter(address(router));
     }
 
     function test_ExecuteSwap_RoutesThroughRegisteredRouter() public {
-        swapMod.setRouter(address(router));
+        swapExecutor.setRouter(address(router));
 
         vm.startPrank(caller);
         usdc.approve(address(router), 100e6);
@@ -44,7 +44,7 @@ contract SwapModTest is Test {
         path[0] = address(usdc);
         path[1] = address(weth);
 
-        uint256 out = swapMod.executeSwap(path, 100e6, 1, caller, recipient);
+        uint256 out = swapExecutor.executeSwap(path, 100e6, 1, caller, recipient);
         assertEq(out, 100e18);
         assertEq(weth.balanceOf(recipient), 100e18);
     }
@@ -54,6 +54,6 @@ contract SwapModTest is Test {
         path[0] = address(usdc);
         path[1] = address(weth);
         vm.expectRevert(bytes("NO_ROUTER"));
-        swapMod.executeSwap(path, 1e6, 0, caller, recipient);
+        swapExecutor.executeSwap(path, 1e6, 0, caller, recipient);
     }
 }

@@ -32,7 +32,7 @@ else
 fi
 
 # Core modules must have a purpose sentence and a function table header nearby.
-for core in ZenoIndexVault Vault Pricing Swap_mod VaultMath UniswapV4Adapter; do
+for core in ZenoIndexVault Vault Pricing SwapExecutor VaultMath UniswapV4Adapter; do
   if ! grep -Eq "### .*${core}\\.sol" "$README"; then
     echo "FAIL: missing section heading for ${core}.sol" >&2
     missing=$((missing + 1))
@@ -87,14 +87,14 @@ else
   missing=$((missing + 1))
 fi
 
-if section_has Vault "VaultMath.computeSharesToMint" "ShareToken.mint" "Pricing.sumNav" "ISwapModLike.executeSwap" "ReentrancyGuard"; then
+if section_has Vault "VaultMath.computeSharesToMint" "ShareToken.mint" "Pricing.sumNav" "ISwapExecutorLike.executeSwap" "ReentrancyGuard"; then
   echo "OK: Vault deps match deposit/NAV/swap path"
 else
   missing=$((missing + 1))
 fi
 
-if section_has Swap_mod "ISwapRouter(router).swap"; then
-  echo "OK: Swap_mod deps match executeSwap → ISwapRouter"
+if section_has SwapExecutor "ISwapRouter(router).swap"; then
+  echo "OK: SwapExecutor deps match executeSwap → ISwapRouter"
 else
   missing=$((missing + 1))
 fi

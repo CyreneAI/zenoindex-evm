@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
 import {Pricing} from "../src/Pricing.sol";
-import {Swap_mod} from "../src/Swap_mod.sol";
+import {SwapExecutor} from "../src/SwapExecutor.sol";
 import {Constants} from "../src/libraries/Constants.sol";
 import {ShareToken} from "../src/tokens/ShareToken.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
@@ -23,7 +23,7 @@ contract ZenoIndexVaultTest is Test {
     ZenoIndexVault internal zenoIndexVault;
     Vault internal vaultImpl;
     Pricing internal pricing;
-    Swap_mod internal swapMod;
+    SwapExecutor internal swapExecutor;
     MockERC20 internal usdc;
     MockERC20 internal tokenA;
     MockERC20 internal tokenB;
@@ -62,10 +62,10 @@ contract ZenoIndexVaultTest is Test {
         vaultImpl = new Vault();
         pricing = new Pricing();
         zenoIndexVault = new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(oracle));
-        swapMod = new Swap_mod(address(zenoIndexVault));
+        swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
         zenoIndexVault.setPricingModule(address(pricing));
-        zenoIndexVault.setSwapModule(address(swapMod));
+        zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(address(router));
         zenoIndexVault.setEtfCreationAuthority(manager);
 

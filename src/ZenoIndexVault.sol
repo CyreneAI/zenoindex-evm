@@ -12,7 +12,7 @@ interface ISwapModAdmin {
 }
 
 /// @notice Root contract: super-admin, treasury, emergency flag, asset registry, the
-///         Pricing/Swap_mod address registry, and the ERC-1167 clone factory for vaults.
+///         Pricing/SwapExecutor address registry, and the ERC-1167 clone factory for vaults.
 ///         No `init_global_state` — a real constructor does that job.
 contract ZenoIndexVault is IZenoIndexVault {
     struct CreateVaultParams {
@@ -162,7 +162,7 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit PricingModuleSet(module);
     }
 
-    /// @notice Sets Swap_mod.sol itself (rare) — for switching the DEX-execution router
+    /// @notice Sets SwapExecutor.sol itself (rare) — for switching the DEX-execution router
     ///         address that clones use day to day, use `setSwapRouter` instead.
     function setSwapModule(address module) external onlySuperAdmin {
         if (module == address(0)) revert ZeroAddress();
@@ -170,7 +170,7 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit SwapModuleSet(module, address(0));
     }
 
-    /// @notice Relays to Swap_mod.sol's `setRouter`, which is itself gated to only accept
+    /// @notice Relays to SwapExecutor.sol's `setRouter`, which is itself gated to only accept
     ///         calls from this contract.
     function setSwapRouter(address router) external onlySuperAdmin {
         if (router == address(0)) revert ZeroAddress();

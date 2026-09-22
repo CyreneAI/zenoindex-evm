@@ -17,7 +17,7 @@ flowchart TB
 
   subgraph Singletons["Shared modules"]
     P["Pricing.sol"]
-    SM["Swap_mod.sol"]
+    SM["SwapExecutor.sol"]
   end
 
   subgraph Adapters["Adapters / oracles"]
@@ -47,7 +47,7 @@ flowchart TB
   V -->|new ShareToken| ST
   V -->|IZenoIndexVault reads| ZIV
   V -->|IPricingLike.sumNav| P
-  V -->|ISwapModLike.executeSwap| SM
+  V -->|ISwapExecutorLike.executeSwap| SM
   V --> VM
   V --> C
   V --> E20
@@ -68,7 +68,7 @@ flowchart TB
 
 Production call path (simplified):
 
-`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `Pricing.sumNav` + `Swap_mod.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock) + `IPriceOracle`.
+`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `Pricing.sumNav` + `SwapExecutor.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock) + `IPriceOracle`.
 
 ---
 
@@ -78,7 +78,7 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 
 ### `src/ZenoIndexVault.sol`
 
-**What it does:** Root factory and registry — super-admin, treasury, emergency flag, asset registry, Pricing/Swap_mod pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays.
+**What it does:** Root factory and registry — super-admin, treasury, emergency flag, asset registry, Pricing/SwapExecutor pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays.
 
 | Function | Dependencies / calls |
 |---|---|
@@ -87,8 +87,8 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 | `updateTreasury` / `setEmergency` / `setEtfCreationAuthority` / `setOperator` | Super-admin config |
 | `setPriceOracle` | Rotates oracle address used by vaults |
 | `setPricingModule` | Stores `Pricing` singleton address |
-| `setSwapModule` | Stores `Swap_mod` singleton address |
-| `setSwapRouter` | → `ISwapModAdmin(swapModule).setRouter` (`Swap_mod`) |
+| `setSwapModule` | Stores `SwapExecutor` singleton address |
+| `setSwapRouter` | → `ISwapModAdmin(swapModule).setRouter` (`SwapExecutor`) |
 | `createAsset` / `setAssetActive` / `getAsset` | Asset registry storage |
 | `createVault` | → `Constants.MAX_ASSETS`; `Clones.clone` (OpenZeppelin); `IVault(clone).init` (`Vault`) |
 | `confirmWriteOff` / `confirmReactivate` | → `IVault(clone).executeWriteOff` / `executeReactivate` |
@@ -115,10 +115,10 @@ Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `pricin
 | `requestRedeem` | → `IZenoIndexVault.getAsset`; `ERC20Minimal.balanceOf`; `VaultMath.computeRedeemSwapAmounts` / `computePendingCarve`; `ShareToken.burn` |
 | `getRedeemState` / `getRedeemAssetAmount` | Redeem views |
 | `claim` | → `VaultMath.computeFeeSplit`; `_payFees`; `ERC20Minimal.transfer`; `_resetRedeem` |
-| `swapUsdcToAsset` | → `IZenoIndexVault.getAsset` / `usdcToken` / `swapModule`; `ISwapModLike.router` / `executeSwap`; `ERC20Minimal.approve` |
+| `swapUsdcToAsset` | → `IZenoIndexVault.getAsset` / `usdcToken` / `swapModule`; `ISwapExecutorLike.router` / `executeSwap`; `ERC20Minimal.approve` |
 | `swapAssetToUsdc` | Same swap path as above for redeem unwind |
 | `setTargetAllocations` | → `Constants.MAX_ASSETS` / `BPS_DENOM` |
-| `executeRebalance` | → `_sumNav`; `IZenoIndexVault.getAsset` / `usdcToken` / `swapModule`; `IPriceOracleLike.quoteUsdc`; `ISwapModLike.executeSwap`; `Constants.REBALANCE_DRIFT_BPS`; may `_retireSlot` |
+| `executeRebalance` | → `_sumNav`; `IZenoIndexVault.getAsset` / `usdcToken` / `swapModule`; `IPriceOracleLike.quoteUsdc`; `ISwapExecutorLike.executeSwap`; `Constants.REBALANCE_DRIFT_BPS`; may `_retireSlot` |
 | `proposeWriteOff` / `proposeReactivate` | Manager proposes Path B |
 | `executeWriteOff` / `executeReactivate` | Called by `ZenoIndexVault`; → oracle / `ERC20Minimal` / `_retireSlot` |
 
@@ -138,7 +138,7 @@ Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`; `IZenoIndexVault`, `IV
 
 ---
 
-### `src/Swap_mod.sol`
+### `src/SwapExecutor.sol`
 
 **What it does:** Singleton swap orchestrator. Holds the current `ISwapRouter` address; vaults call it to execute swaps without custodied tokens.
 
