@@ -15,6 +15,12 @@ loosened earlier for real-AMM slippage, unrelated to this pass). 14 new
 regression tests were added, one per fix, each verified to fail when its fix
 is reverted. **49/49 tests pass.**
 
+**Update (follow-up pass, same day):** a self-review of the fixes above (see
+"C6 — follow-up: fix was incomplete" below) found that the Critical #6 fix
+was too narrow, and separately confirmed and fixed the `setTargetAllocations`
+NAV-DOS gap that the original review had listed under High. Both are now
+fully fixed, with 4 more regression tests added. **53/53 tests pass.**
+
 ---
 
 ## Critical — fixed
@@ -120,6 +126,75 @@ Regression test: `test_ExecuteWriteOff_RevertsWhileAssetIsReservedForActiveRedee
 (deposits, deploys, requests a redeem so `reservedAt(0) > 0`, then asserts
 `confirmWriteOff` reverts with `AssetReserved`).
 
+#### C6 — follow-up: fix was incomplete
+
+The initial fix above only blocked write-off of **the exact slot** holding a
+reservation. Two related loopholes remained, both because `requestRedeem`
+reserves a *pro-rata* amount per slot — a slot can end up with
+`_reservedAssets[slot] == 0` (rounds to 0, or was never deployed) while the
+redeemer's `RedeemState` is still active and still spans that slot index:
+
+- `executeWriteOff` on a **different, unreserved** slot could still retire
+  it via `_retireSlot`'s index-compaction while another slot's redeem leg
+  was still in flight, desyncing that redeemer's `RedeemState` just the same
+  as the originally-reported bug.
+- `executeRebalance`'s auto-retire (the 0%-target/zero-balance compaction at
+  the end of the function) had no redeem guard at all — it could retire a
+  slot mid-redeem unconditionally.
+
+**Fix:** added a vault-wide `activeRedeemCount` counter (incremented in
+`requestRedeem`, decremented in `_resetRedeem`/`claim`). Slot retirement is
+now blocked whenever `activeRedeemCount > 0`, regardless of which slot is
+retiring or whether it happens to hold a reservation itself:
+- `executeWriteOff` now reverts `AssetReserved` on `activeRedeemCount > 0`
+  (replacing the narrower per-slot check).
+- `executeRebalance`'s auto-retire now additionally requires
+  `activeRedeemCount == 0` before compacting — if unsafe, it simply skips
+  (the slot stays at 0% until a later call once redeems clear); this path
+  isn't manager/admin-confirmed the way write-off is, so failing the whole
+  rebalance call would be disproportionate.
+- `_retireSlot` itself asserts `activeRedeemCount == 0` as a last-line
+  invariant, so a future caller can't reintroduce this class of bug by
+  forgetting the guard.
+
+Regression tests:
+`test_ExecuteWriteOff_RevertsForUnrelatedSlotWhileAnyRedeemIsActive` (slot 1
+never deployed, so it has zero reservation, while slot 0's redeem leg is
+still unswapped — write-off of slot 1 must still revert) and
+`test_ExecuteRebalance_AutoRetireSkipsWhileAnyRedeemIsActive` (slot 1 is the
+vault's only funded asset, so its wind-down sell clears to exactly zero
+balance in one call with no rounding dust — `numAssets` must stay unchanged
+while a redeem on slot 0 is active). Both were verified to fail against the
+pre-follow-up code (reverting the guard locally, confirming the assertion
+fails, then restoring it) before being kept.
+
+### 5b. `setTargetAllocations` accepts unregistered/inactive asset ids (NAV DOS)
+
+Flagged by the original review under High ("`setTargetAllocations` still
+accepts unregistered ids (NAV DOS)"). `setTargetAllocations` checked
+`isWrittenOff[id]` but never checked whether `id` was ever registered via
+`ZenoIndexVault.createAsset`, or whether it's still active. An unregistered
+`id` resolves through `getAsset(id)` to `mint == address(0)`; once stored as
+a slot, every subsequent NAV read (`_sumNav` → `Pricing.sumNav` →
+`ERC20Minimal(address(0)).balanceOf(...)`, a call into a zero-code address)
+reverts — permanently bricking `deposit`, `requestRedeem`, `executeRebalance`,
+and `totalNav()` for that vault. `Vault.init` doesn't need the same guard
+directly: its only caller, `ZenoIndexVault.createVault`, already validates
+`exists`/`active` on every id before cloning.
+
+**Fix (`src/Vault.sol`, `setTargetAllocations`):**
+```solidity
+(,, bool active, bool exists) = IZenoIndexVault(zenoIndexVault).getAsset(id);
+if (!exists) revert AssetNotRegistered();
+if (!active) revert AssetNotActive();
+```
+
+Regression tests: `test_SetTargetAllocations_RevertsOnUnregisteredAssetId`,
+`test_SetTargetAllocations_RevertsOnInactiveAssetId` — both verified to pass
+`setTargetAllocations` itself (no immediate revert) but fail once a
+subsequent NAV read is attempted, confirming this was a real, deferred DOS
+rather than a no-op with the fix reverted.
+
 ---
 
 ## High — fixed (mechanical subset)
@@ -160,15 +235,25 @@ Carried over from `PRE_MAINNET_REVIEW.md`, unchanged:
 - No oracle-enforced slippage floor was added to `Vault.sol`'s swap paths —
   per the earlier scoping decision, `minOut`/`minAssetOut` remain fully
   caller-supplied; only path-end correctness was enforced.
-- All of "Testing — green, too thin for mainnet" beyond the 14 new
-  regression tests: no fuzzing, no invariant tests, no pause/emergency
-  matrix, no fee-on-transfer/rebasing coverage, `ZenoIndexVault` admin
-  surface (two-step super-admin, `setAssetActive`, `setVaultEmergencyLock`)
-  is still largely untested.
+- Wind-down against a live AMM still leaves sub-drift-band dust rather than
+  reaching an exact zero balance in one pass (documented directly in
+  `test_ExecuteRebalance_WindDownSellsDownToSubDriftBandDust`); this is a
+  known tradeoff of sizing the sell off oracle price against an AMM fill,
+  not something the `activeRedeemCount` follow-up fix changes.
+- All of "Testing — green, too thin for mainnet" beyond the regression tests
+  added across both passes: no fuzzing, no invariant tests, no
+  pause/emergency matrix, no fee-on-transfer/rebasing coverage,
+  `ZenoIndexVault` admin surface (two-step super-admin, `setAssetActive`,
+  `setVaultEmergencyLock`) is still largely untested.
+
+**Fixed in the follow-up pass** (previously listed here as open): C6's
+unrelated-slot/auto-retire loophole, and `setTargetAllocations` accepting
+unregistered/inactive asset ids (NAV DOS) — see the C6 follow-up and §5b
+sections above.
 
 ---
 
-## Coverage after this pass
+## Coverage after both passes
 
 `forge coverage --ir-minimum`:
 
@@ -176,24 +261,33 @@ Carried over from `PRE_MAINNET_REVIEW.md`, unchanged:
 |---|---|---|---|---|
 | `src/Pricing.sol` | 100% | 100% | 60% | 100% |
 | `src/Swap_mod.sol` | 100% | 83% | 20% | 100% |
-| `src/Vault.sol` | 90% | 83% | 32% | 85% |
-| `src/ZenoIndexVault.sol` | 69% | 64% | 22% | 58% |
+| `src/Vault.sol` | 90% | 84% | 33% | 85% |
+| `src/ZenoIndexVault.sol` | 73% | 67% | 22% | 63% |
 | `src/adapters/UniswapV4Adapter.sol` | 85% | 86% | 29% | 71% |
 | `src/libraries/VaultMath.sol` | 75% | 61% | 6% | 78% |
-| **Total** | **81%** | **75%** | **27%** | **79%** |
+| **Total** | **82%** | **76%** | **27%** | **80%** |
 
-Branch coverage moved from 21% → 27% and `ZenoIndexVault.sol` branch coverage
-from 0% → 22% as a side effect of the new revert-path tests, but this pass
-was not a coverage sprint — the testing gaps listed above are still open.
+Coverage moved incrementally as a side effect of the new revert-path tests,
+but neither pass was a coverage sprint — the testing gaps listed above are
+still open.
 
 ---
 
 ## Verdict
 
-The 6 Critical, fund-safety-breaking bugs are closed, plus 4 mechanical High
-items. **This does not clear the project for mainnet** — the un-fixed High
-items (global operator scope, oracle freshness, incomplete emergency
-controls, no redeem cancellation) and the testing gaps are still real gaps
-per the original review, and an independent audit is still recommended before
-any mainnet deploy, per `PRE_MAINNET_REVIEW.md`'s original operational
-blockers (items 2–4 there are unaffected by this pass).
+The 6 Critical, fund-safety-breaking bugs are closed (including the C6
+loophole this follow-up pass found and closed), plus 4 mechanical High items
+and the `setTargetAllocations` NAV-DOS gap. **This does not clear the
+project for mainnet** — the remaining High items (global operator scope,
+oracle freshness, incomplete emergency controls, no redeem cancellation) and
+the testing gaps are still real gaps per the original review, and an
+independent audit is still recommended before any mainnet deploy, per
+`PRE_MAINNET_REVIEW.md`'s original operational blockers (items 2–4 there are
+unaffected by either pass).
+
+This report itself should be read alongside the fact that the first pass's
+own fix for Critical #6 turned out to be incomplete — a reminder that a
+"fixed" claim for one instance of a bug class doesn't guarantee every
+instance of that class is covered, and is exactly why a third-party audit
+remains recommended before mainnet regardless of how green this test suite
+is.

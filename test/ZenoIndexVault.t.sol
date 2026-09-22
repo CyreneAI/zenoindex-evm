@@ -788,6 +788,47 @@ contract ZenoIndexVaultTest is Test {
         v.setTargetAllocations(ids, bps);
     }
 
+    /// @dev "setTargetAllocations still accepts unregistered ids (NAV DOS)": an assetId that
+    ///      was never created via ZenoIndexVault.createAsset resolves via getAsset() to
+    ///      mint == address(0). Storing it as a slot would permanently brick every NAV read
+    ///      (deposit/redeem/rebalance/totalNav) for the vault, since ERC20Minimal(address(0))
+    ///      has no code to call. setTargetAllocations must reject it up front.
+    function test_SetTargetAllocations_RevertsOnUnregisteredAssetId() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        uint64 unregisteredAssetId = 999;
+
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = unregisteredAssetId;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 5000;
+        bps[1] = 5000;
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.AssetNotRegistered.selector);
+        v.setTargetAllocations(ids, bps);
+    }
+
+    function test_SetTargetAllocations_RevertsOnInactiveAssetId() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        zenoIndexVault.setAssetActive(assetB, false);
+
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetB;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 5000;
+        bps[1] = 5000;
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.AssetNotActive.selector);
+        v.setTargetAllocations(ids, bps);
+    }
+
     function test_CreateAsset_RevertsOnDuplicateMint() public {
         vm.expectRevert(ZenoIndexVault.DuplicateMint.selector);
         zenoIndexVault.createAsset(address(tokenA));
@@ -829,6 +870,106 @@ contract ZenoIndexVaultTest is Test {
         path = new address[](2);
         path[0] = address(usdc);
         path[1] = token;
+    }
+
+    /// @dev Critical #6 (full fix): write-off/wind-down of a DIFFERENT, unreserved slot must
+    ///      also be blocked while any redeem is active — not only a write-off of the exact
+    ///      slot holding the reservation. Here slot 1 (tokenB) never got deployed, so its
+    ///      _reservedAssets stays 0 even after requestRedeem (its pro-rata amount rounds to
+    ///      0 on undeployed balance), while slot 0 (tokenA) still has an unswapped redeem
+    ///      leg — so the redeem as a whole is still active. Writing off slot 1 must still be
+    ///      blocked, because _retireSlot would compact slot 0 out from under the in-flight
+    ///      RedeemState if numAssets ever shrank past it.
+    function test_ExecuteWriteOff_RevertsForUnrelatedSlotWhileAnyRedeemIsActive() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        // Deploy only slot 0 (tokenA); leave slot 1 (tokenB) undeployed so its free balance,
+        // and therefore its reservation from requestRedeem, is 0.
+        vm.prank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+
+        uint256 depositAmt = 100_000_000;
+        vm.startPrank(user);
+        usdc.approve(address(v), depositAmt);
+        v.deposit(depositAmt, 0);
+        uint256 redeemShares = ShareToken(v.sharesToken()).balanceOf(user);
+        v.requestRedeem(redeemShares);
+        vm.stopPrank();
+
+        assertGt(v.reservedAt(0), 0, "slot 0 (tokenA) should hold a reservation from the redeem");
+        assertEq(v.reservedAt(1), 0, "slot 1 (tokenB) never deployed, so it has nothing reserved");
+        (bool active,,) = v.getRedeemState(user);
+        assertTrue(active, "redeem should still be active (slot 0's leg is unswapped)");
+        assertEq(v.activeRedeemCount(), 1);
+
+        vm.prank(manager);
+        v.proposeWriteOff(assetB);
+
+        // Old (partial) fix only checked _reservedAssets[slotB] == 0 and would have allowed
+        // this through. The full fix blocks on activeRedeemCount instead.
+        vm.expectRevert(Vault.AssetReserved.selector);
+        zenoIndexVault.confirmWriteOff(0, assetB);
+    }
+
+    /// @dev Same loophole via the auto-retire path in executeRebalance's wind-down branch:
+    ///      a 0%-target, zero-balance, unreserved slot must NOT be compacted out while a
+    ///      different slot's redeem leg is still in flight — it should just skip and leave
+    ///      the slot in place instead.
+    ///
+    ///      Slot 1 (tokenB) is the vault's only funded asset here, so its oracle-priced
+    ///      value equals the entire NAV and currentBps rounds to exactly BPS_DENOM — the
+    ///      sell-delta math (Vault.sol's executeRebalance) then sizes sellAmount == free
+    ///      exactly, with no rounding dust, so it reliably clears the whole balance to 0
+    ///      in one call (unlike the multi-asset case in
+    ///      test_ExecuteRebalance_WindDownSellsDownToSubDriftBandDust, where dust is
+    ///      unavoidable).
+    function test_ExecuteRebalance_AutoRetireSkipsWhileAnyRedeemIsActive() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        // Deploy only slot 1 (tokenB); slot 0 (tokenA) stays undeployed so it contributes
+        // nothing to NAV and slot 1's value equals the whole NAV.
+        vm.prank(manager);
+        v.swapUsdcToAsset(1, _pathUsdcTo(address(tokenB)), 0);
+        assertGt(tokenB.balanceOf(address(v)), 0);
+
+        // Wind slot 1 down to 0% target (slot 0 takes 100%).
+        uint64[] memory ids = new uint64[](1);
+        ids[0] = assetA;
+        uint16[] memory bps = new uint16[](1);
+        bps[0] = 10_000;
+        vm.prank(manager);
+        v.setTargetAllocations(ids, bps);
+        assertEq(v.allocationBpsAt(1), 0);
+
+        // Start a redeem so activeRedeemCount > 0 while slot 1 winds down. Its pro-rata
+        // reservation lands mostly on slot 1 (the only funded asset) — swap that leg first
+        // so slot 1 ends with zero balance AND zero reservation, satisfying every
+        // auto-retire precondition except activeRedeemCount == 0.
+        uint256 depositAmt = 100_000_000;
+        vm.startPrank(user);
+        usdc.approve(address(v), depositAmt);
+        v.deposit(depositAmt, 0);
+        uint256 redeemShares = ShareToken(v.sharesToken()).balanceOf(user);
+        v.requestRedeem(redeemShares);
+        address[] memory redeemPathB = new address[](2);
+        redeemPathB[0] = address(tokenB);
+        redeemPathB[1] = address(usdc);
+        v.swapAssetToUsdc(1, redeemPathB, 0);
+        vm.stopPrank();
+        assertEq(v.reservedAt(1), 0, "slot 1's redeem leg should be fully swapped, reservation cleared");
+        assertEq(v.activeRedeemCount(), 1, "slot 0's leg is still unswapped, so the redeem is still active");
+
+        address[] memory sellPath = new address[](2);
+        sellPath[0] = address(tokenB);
+        sellPath[1] = address(usdc);
+
+        vm.prank(manager);
+        v.executeRebalance(1, sellPath, 0);
+
+        assertEq(tokenB.balanceOf(address(v)), 0, "the sell should fully clear slot 1's remaining free balance");
+        assertEq(v.numAssets(), 2, "auto-retire must skip while a redeem is active, even at zero balance");
     }
 
     /// @dev High: createVault must require etfCreationAuthority to be set — an unset gate

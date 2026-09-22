@@ -88,6 +88,12 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     mapping(address => RedeemState) internal redeemStates;
     mapping(address => uint256) public redeemUsdcBal;
     uint256 public vaultRedeemEscrowTotal;
+    /// @dev Count of RedeemStates with isRedeemActive == true. Every active RedeemState's
+    ///      assetAmountIn/assetSwapped arrays are indexed against the slot layout as it
+    ///      existed at requestRedeem time — _retireSlot's index-compaction desyncs any such
+    ///      state (not just one with a nonzero reservation on the exact slot retiring), so
+    ///      slot retirement is blocked outright while this is nonzero.
+    uint256 public activeRedeemCount;
 
     // ── Events ────────────────────────────────────────────────────────────────
     event GenesisSeeded(address depositor, uint256 seedUsdc, uint256 baseline, uint256 sharesMinted);
@@ -136,6 +142,8 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     error DuplicateAsset();
     error AssetReserved();
     error PathEnd();
+    error AssetNotRegistered();
+    error AssetNotActive();
 
     modifier onlyManager() {
         if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isOperator(msg.sender)) {
@@ -381,6 +389,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         for (uint8 i = 0; i < n; i++) {
             rs.assetSwapped[i] = (amounts[i] == 0);
         }
+        activeRedeemCount += 1;
 
         emit RequestRedeem(msg.sender, shares, carve.usdcSlice);
     }
@@ -524,6 +533,15 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             uint64 id = assetIds[j];
             if (isWrittenOff[id]) revert AssetIsWrittenOff();
 
+            // Reject an assetId that was never registered on ZenoIndexVault.sol (or was
+            // deactivated) — accepting it here would store a slot whose getAsset(id) later
+            // resolves to mint == address(0), and every NAV read (_sumNav -> Pricing.sumNav
+            // -> ERC20Minimal(address(0)).balanceOf(...)) then reverts, permanently
+            // bricking deposit/redeem/rebalance for the whole vault.
+            (,, bool active, bool exists) = IZenoIndexVault(zenoIndexVault).getAsset(id);
+            if (!exists) revert AssetNotRegistered();
+            if (!active) revert AssetNotActive();
+
             int256 existingSlot = -1;
             for (uint8 i = 0; i < oldN; i++) {
                 if (_assetIds[i] == id) {
@@ -609,16 +627,23 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             emit RebalanceExecuted(assetIndex, buyAmount, false);
         }
 
-        // If this slot's target is 0 and its balance has hit zero, compact it out.
+        // If this slot's target is 0 and its balance has hit zero, compact it out — but
+        // only when no redeem is in flight (see _retireSlot). Skipping here is safe: the
+        // slot just stays at 0% until a later rebalance call retires it once redeems clear.
         if (_allocationBps[assetIndex] == 0) {
             uint256 remainingBal = ERC20Minimal(mint).balanceOf(address(this));
-            if (remainingBal == 0 && _reservedAssets[assetIndex] == 0) {
+            if (remainingBal == 0 && _reservedAssets[assetIndex] == 0 && activeRedeemCount == 0) {
                 _retireSlot(assetIndex);
             }
         }
     }
 
+    /// @dev Every caller must ensure activeRedeemCount == 0 first (see executeWriteOff and
+    ///      executeRebalance) — compaction below shifts the last slot's data into `index`,
+    ///      which desyncs any RedeemState still indexed against the pre-compaction layout.
+    ///      Asserted here too as a last-line invariant, not just documented at call sites.
     function _retireSlot(uint8 index) internal {
+        assert(activeRedeemCount == 0);
         // Drop this slot's undeployed pending before compacting — otherwise totalPendingUsdc
         // keeps earmarking USDC that can never be swapped via the retired assetId.
         uint256 pending = _usdcTargetAmount[index];
@@ -661,11 +686,11 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         pendingWriteOff[assetId] = false;
 
         uint8 slot = _slotOf(assetId);
-        // A slot with reserved balance has an in-flight redeem leg pinned to this slot
-        // index. Retiring it now (via _retireSlot's compaction) would desync that
-        // redeemer's RedeemState, which is keyed by index — block until the reserved
-        // amount clears (swapAssetToUsdc completes that leg, or the redeemer claims).
-        if (_reservedAssets[slot] > 0) revert AssetReserved();
+        // Any active redeem's RedeemState is indexed against the slot layout as it existed
+        // at requestRedeem time — _retireSlot's index-compaction desyncs it regardless of
+        // which slot retires, not only one with a nonzero reservation on this exact slot.
+        // Block until every in-flight redeem clears (via claim).
+        if (activeRedeemCount > 0) revert AssetReserved();
         (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(assetId);
         uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
         uint256 navContribution;
@@ -759,5 +784,6 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             rs.assetAmountIn[i] = 0;
             rs.assetSwapped[i] = false;
         }
+        activeRedeemCount -= 1;
     }
 }
