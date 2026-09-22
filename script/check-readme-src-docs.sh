@@ -32,7 +32,7 @@ else
 fi
 
 # Core modules must have a purpose sentence and a function table header nearby.
-for core in ZenoIndexVault Vault NavCalculation SwapExecutor VaultMath UniswapV4Adapter; do
+for core in ZenoIndexVault Vault NavCalculation SwapExecutor AccessMaster VaultMath UniswapV4Adapter; do
   if ! grep -Eq "### .*${core}\\.sol" "$README"; then
     echo "FAIL: missing section heading for ${core}.sol" >&2
     missing=$((missing + 1))
@@ -95,6 +95,12 @@ fi
 
 if section_has SwapExecutor "ISwapRouter(router).swap"; then
   echo "OK: SwapExecutor deps match executeSwap → ISwapRouter"
+else
+  missing=$((missing + 1))
+fi
+
+if section_has AccessMaster "AccessControl" "setSuperAdmin" "addOperator" "removeOperator" "OPERATOR_ROLE"; then
+  echo "OK: AccessMaster deps match OpenZeppelin AccessControl usage"
 else
   missing=$((missing + 1))
 fi

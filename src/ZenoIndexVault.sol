@@ -5,14 +5,19 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Vault} from "./Vault.sol";
 import {IZenoIndexVault} from "./interfaces/IZenoIndexVault.sol";
 import {IVault} from "./interfaces/IVault.sol";
+import {IAccessMaster} from "./interfaces/IAccessMaster.sol";
 import {Constants} from "./libraries/Constants.sol";
 
 interface ISwapModAdmin {
     function setRouter(address newRouter) external;
 }
 
-/// @notice Root contract: super-admin, treasury, emergency flag, asset registry, the
-///         NavCalculation/SwapExecutor address registry, and the ERC-1167 clone factory for vaults.
+/// @notice Root contract: emergency flag, asset registry, the NavCalculation/SwapExecutor
+///         address registry, and the ERC-1167 clone factory for vaults. Super-admin,
+///         operator roles, and treasury are NOT stored here — they live in AccessMaster.sol
+///         (set once at construction) and are read live via IAccessMaster, so there is
+///         exactly one place across the whole protocol that answers "who is admin /
+///         operator" and "where do fees go".
 ///         No `init_global_state` — a real constructor does that job.
 contract ZenoIndexVault is IZenoIndexVault {
     struct CreateVaultParams {
@@ -35,9 +40,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
-    address public superAdmin;
-    address public pendingSuperAdminAddr;
-    address public treasury;
+    address public accessMaster;
     address public usdcToken;
     address public priceOracle;
     bool public isEmergency;
@@ -47,9 +50,6 @@ contract ZenoIndexVault is IZenoIndexVault {
     address public vaultImplementation;
     address public pricingModule;
     address public swapModule;
-
-    // ── Roles ─────────────────────────────────────────────────────────────────
-    mapping(address => bool) public isOperator;
 
     // ── Asset registry ────────────────────────────────────────────────────────
     mapping(uint64 => AssetInfo) internal _assets;
@@ -61,14 +61,10 @@ contract ZenoIndexVault is IZenoIndexVault {
     mapping(uint64 => address) public vaultClones;
 
     // ── Events ────────────────────────────────────────────────────────────────
-    event SuperAdminProposed(address indexed newSuperAdmin);
-    event SuperAdminAccepted(address indexed newSuperAdmin);
-    event TreasuryUpdated(address indexed treasury);
     event EmergencySet(bool isEmergency);
     event EtfCreationAuthoritySet(address indexed authority);
     event PricingModuleSet(address indexed module);
     event SwapModuleSet(address indexed module, address indexed router);
-    event OperatorSet(address indexed account, bool isOperator);
     event AssetCreated(uint64 indexed assetId, address mint);
     event AssetActiveSet(uint64 indexed assetId, bool active);
     event VaultCreated(uint64 indexed vaultId, address indexed clone, address manager);
@@ -78,7 +74,6 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error NotSuperAdmin();
-    error NotPendingSuperAdmin();
     error ZeroAddress();
     error AlreadyExists();
     error AssetMissing();
@@ -92,59 +87,52 @@ contract ZenoIndexVault is IZenoIndexVault {
     error DuplicateMint();
 
     modifier onlySuperAdmin() {
-        if (msg.sender != superAdmin) revert NotSuperAdmin();
+        if (msg.sender != IAccessMaster(accessMaster).superAdmin()) revert NotSuperAdmin();
         _;
     }
 
-    /// @dev Super-admin or any account flagged via setOperator — used for asset-registry
-    ///      actions (createAsset / setAssetActive) so operators can add/remove assets
-    ///      without needing super-admin's other, more sensitive powers (treasury, emergency,
-    ///      module/oracle rotation, super-admin transfer).
+    /// @dev Super-admin or any account flagged as an operator on AccessMaster — used for
+    ///      asset-registry actions (createAsset / setAssetActive) so operators can add/remove
+    ///      assets without needing super-admin's other, more sensitive powers (treasury,
+    ///      emergency, module/oracle rotation, super-admin transfer).
     modifier onlySuperAdminOrOperator() {
-        if (msg.sender != superAdmin && !isOperator[msg.sender]) revert NotSuperAdmin();
+        IAccessMaster roles = IAccessMaster(accessMaster);
+        if (msg.sender != roles.superAdmin() && !roles.isOperator(msg.sender)) revert NotSuperAdmin();
         _;
     }
 
-    constructor(address usdcToken_, address treasury_, address vaultImplementation_, address priceOracle_) {
+    constructor(address usdcToken_, address vaultImplementation_, address priceOracle_, address accessMaster_) {
         if (
-            usdcToken_ == address(0) || treasury_ == address(0) || vaultImplementation_ == address(0)
-                || priceOracle_ == address(0)
+            usdcToken_ == address(0) || vaultImplementation_ == address(0) || priceOracle_ == address(0)
+                || accessMaster_ == address(0)
         ) {
             revert ZeroAddress();
         }
-        superAdmin = msg.sender;
+        accessMaster = accessMaster_;
         usdcToken = usdcToken_;
-        treasury = treasury_;
         vaultImplementation = vaultImplementation_;
         priceOracle = priceOracle_;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Admin: super-admin transfer (two-step)
+    // Roles + treasury — read live from AccessMaster.sol, never cached (IZenoIndexVault surface)
     // ══════════════════════════════════════════════════════════════════════════
 
-    function setPendingSuperAdmin(address newSuperAdmin) external onlySuperAdmin {
-        if (newSuperAdmin == address(0)) revert ZeroAddress();
-        pendingSuperAdminAddr = newSuperAdmin;
-        emit SuperAdminProposed(newSuperAdmin);
+    function superAdmin() external view returns (address) {
+        return IAccessMaster(accessMaster).superAdmin();
     }
 
-    function acceptSuperAdmin() external {
-        if (msg.sender != pendingSuperAdminAddr) revert NotPendingSuperAdmin();
-        superAdmin = msg.sender;
-        pendingSuperAdminAddr = address(0);
-        emit SuperAdminAccepted(msg.sender);
+    function isOperator(address account) external view returns (bool) {
+        return IAccessMaster(accessMaster).isOperator(account);
+    }
+
+    function treasury() external view returns (address) {
+        return IAccessMaster(accessMaster).treasury();
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     // Admin: config
     // ══════════════════════════════════════════════════════════════════════════
-
-    function updateTreasury(address treasury_) external onlySuperAdmin {
-        if (treasury_ == address(0)) revert ZeroAddress();
-        treasury = treasury_;
-        emit TreasuryUpdated(treasury_);
-    }
 
     function setEmergency(bool isEmergency_) external onlySuperAdmin {
         isEmergency = isEmergency_;
@@ -187,11 +175,6 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit SwapModuleSet(swapModule, router);
     }
 
-    function setOperator(address account, bool isOperator_) external onlySuperAdmin {
-        isOperator[account] = isOperator_;
-        emit OperatorSet(account, isOperator_);
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // Asset registry
     // ══════════════════════════════════════════════════════════════════════════
@@ -229,7 +212,7 @@ contract ZenoIndexVault is IZenoIndexVault {
 
         address gate = etfCreationAuthority;
         if (gate == address(0)) revert CreationGateNotSet();
-        if (msg.sender != gate && msg.sender != superAdmin) {
+        if (msg.sender != gate && msg.sender != IAccessMaster(accessMaster).superAdmin()) {
             revert UnauthorizedGateAuthority();
         }
 

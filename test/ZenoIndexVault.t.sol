@@ -6,6 +6,7 @@ import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
 import {NavCalculation} from "../src/NavCalculation.sol";
 import {SwapExecutor} from "../src/SwapExecutor.sol";
+import {AccessMaster} from "../src/AccessMaster.sol";
 import {Constants} from "../src/libraries/Constants.sol";
 import {ShareToken} from "../src/tokens/ShareToken.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
@@ -24,6 +25,7 @@ contract ZenoIndexVaultTest is Test {
     Vault internal vaultImpl;
     NavCalculation internal navCalculation;
     SwapExecutor internal swapExecutor;
+    AccessMaster internal accessMaster;
     MockERC20 internal usdc;
     MockERC20 internal tokenA;
     MockERC20 internal tokenB;
@@ -61,7 +63,8 @@ contract ZenoIndexVaultTest is Test {
 
         vaultImpl = new Vault();
         navCalculation = new NavCalculation();
-        zenoIndexVault = new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(oracle));
+        accessMaster = new AccessMaster(address(this), treasury);
+        zenoIndexVault = new ZenoIndexVault(address(usdc), address(vaultImpl), address(oracle), address(accessMaster));
         swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
         zenoIndexVault.setPricingModule(address(navCalculation));
@@ -834,6 +837,60 @@ contract ZenoIndexVaultTest is Test {
         zenoIndexVault.createAsset(address(tokenA));
     }
 
+    /// @dev AccessMaster: an operator (granted via AccessMaster.addOperator, read live
+    ///      through IAccessMaster) can add and deactivate assets, same as super-admin — the
+    ///      role lives entirely in AccessMaster, not in ZenoIndexVault's own storage.
+    function test_CreateAsset_OperatorFromAccessMasterCanAddAsset() public {
+        address operator = address(0xDEED);
+        accessMaster.addOperator(operator);
+
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 6);
+        vm.prank(operator);
+        uint64 assetC = zenoIndexVault.createAsset(address(tokenC));
+
+        (,, bool active, bool exists) = zenoIndexVault.getAsset(assetC);
+        assertTrue(exists);
+        assertTrue(active);
+    }
+
+    function test_SetAssetActive_OperatorFromAccessMasterCanDeactivate() public {
+        address operator = address(0xDEED);
+        accessMaster.addOperator(operator);
+
+        vm.prank(operator);
+        zenoIndexVault.setAssetActive(assetA, false);
+
+        (,, bool active,) = zenoIndexVault.getAsset(assetA);
+        assertFalse(active);
+    }
+
+    function test_CreateAsset_RevertsForAccountNotSuperAdminOrOperator() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.createAsset(address(0xC0FFEE));
+    }
+
+    function test_CreateAsset_RevokedOperatorLosesAccess() public {
+        address operator = address(0xDEED);
+        accessMaster.addOperator(operator);
+        accessMaster.removeOperator(operator);
+
+        vm.prank(operator);
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.createAsset(address(0xC0FFEE));
+    }
+
+    /// @dev ZenoIndexVault.superAdmin()/isOperator() are live passthroughs to AccessMaster —
+    ///      a role change on AccessMaster is reflected immediately with no separate sync step.
+    function test_SuperAdminAndIsOperator_ReadLiveThroughToAccessMaster() public {
+        assertEq(zenoIndexVault.superAdmin(), accessMaster.superAdmin());
+
+        address operator = address(0xDEED);
+        assertFalse(zenoIndexVault.isOperator(operator));
+        accessMaster.addOperator(operator);
+        assertTrue(zenoIndexVault.isOperator(operator));
+    }
+
     /// @dev Critical #6: write-off must be blocked while the slot has a reserved balance
     ///      pinned to an in-flight redeem leg, so slot compaction never desyncs RedeemState.
     function test_ExecuteWriteOff_RevertsWhileAssetIsReservedForActiveRedeem() public {
@@ -975,7 +1032,9 @@ contract ZenoIndexVaultTest is Test {
     /// @dev High: createVault must require etfCreationAuthority to be set — an unset gate
     ///      previously let anyone create a vault.
     function test_CreateVault_RevertsWhenCreationGateUnset() public {
-        ZenoIndexVault freshFactory = new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(oracle));
+        AccessMaster freshAccessMaster = new AccessMaster(address(this), treasury);
+        ZenoIndexVault freshFactory =
+            new ZenoIndexVault(address(usdc), address(vaultImpl), address(oracle), address(freshAccessMaster));
         freshFactory.setPricingModule(address(navCalculation));
 
         uint64[] memory ids = new uint64[](1);
@@ -1002,7 +1061,12 @@ contract ZenoIndexVaultTest is Test {
     /// @dev High: the oracle can never be the zero address, and super-admin can rotate it.
     function test_Constructor_RevertsOnZeroPriceOracle() public {
         vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
-        new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(0));
+        new ZenoIndexVault(address(usdc), address(vaultImpl), address(0), address(accessMaster));
+    }
+
+    function test_Constructor_RevertsOnZeroAccessMaster() public {
+        vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
+        new ZenoIndexVault(address(usdc), address(vaultImpl), address(oracle), address(0));
     }
 
     function test_SetPriceOracle_RotatesOracleAndRejectsZero() public {

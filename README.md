@@ -18,6 +18,7 @@ flowchart TB
   subgraph Singletons["Shared modules"]
     P["NavCalculation.sol"]
     SM["SwapExecutor.sol"]
+    AM["AccessMaster.sol"]
   end
 
   subgraph Adapters["Adapters / oracles"]
@@ -40,9 +41,12 @@ flowchart TB
   ZIV -->|Clones.clone + IVault.init| V
   ZIV -->|setPricingModule| P
   ZIV -->|setSwapModule / setSwapRouter| SM
+  ZIV -->|IAccessMaster reads, set at construction| AM
   ZIV -->|registers| OR
   ZIV --> C
   ZIV --> OZ
+
+  AM -->|extends| OZ
 
   V -->|new ShareToken| ST
   V -->|IZenoIndexVault reads| ZIV
@@ -70,6 +74,8 @@ Production call path (simplified):
 
 `ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `NavCalculation.sumNav` + `SwapExecutor.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock) + `IPriceOracle`.
 
+Roles and treasury are set once at `ZenoIndexVault`'s construction (an `AccessMaster` address) and read live via `IAccessMaster` on every permission check — `ZenoIndexVault` itself holds no admin/operator/treasury storage.
+
 ---
 
 ## `src/` module reference
@@ -78,18 +84,19 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 
 ### `src/ZenoIndexVault.sol`
 
-**What it does:** Root factory and registry — super-admin, treasury, emergency flag, asset registry, NavCalculation/SwapExecutor pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays.
+**What it does:** Root factory and registry — emergency flag, asset registry, NavCalculation/SwapExecutor pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays. Holds no admin/operator/treasury storage of its own — `superAdmin` / `isOperator` / `treasury` are read live from `AccessMaster` (set once at construction) via `IAccessMaster`.
 
 | Function | Dependencies / calls |
 |---|---|
-| `constructor(usdcToken_, treasury_, vaultImplementation_, priceOracle_)` | Sets admin + registry state |
-| `setPendingSuperAdmin` / `acceptSuperAdmin` | Internal admin transfer |
-| `updateTreasury` / `setEmergency` / `setEtfCreationAuthority` / `setOperator` | Super-admin config |
+| `constructor(usdcToken_, vaultImplementation_, priceOracle_, accessMaster_)` | Sets registry state + binds `accessMaster` |
+| `superAdmin` / `isOperator` / `treasury` | → `IAccessMaster(accessMaster)` passthrough views |
+| `setEmergency` / `setEtfCreationAuthority` | Super-admin config (`onlySuperAdmin` → `AccessMaster`) |
 | `setPriceOracle` | Rotates oracle address used by vaults |
 | `setPricingModule` | Stores `NavCalculation` singleton address |
 | `setSwapModule` | Stores `SwapExecutor` singleton address |
 | `setSwapRouter` | → `ISwapModAdmin(swapModule).setRouter` (`SwapExecutor`) |
-| `createAsset` / `setAssetActive` / `getAsset` | Asset registry storage |
+| `createAsset` / `setAssetActive` | Asset registry storage (`onlySuperAdminOrOperator` → `AccessMaster`) |
+| `getAsset` | Asset registry read |
 | `createVault` | → `Constants.MAX_ASSETS`; `Clones.clone` (OpenZeppelin); `IVault(clone).init` (`Vault`) |
 | `confirmWriteOff` / `confirmReactivate` | → `IVault(clone).executeWriteOff` / `executeReactivate` |
 | `setVaultEmergencyLock` | → `Vault(clone).setVaultEmergencyLock` |
@@ -147,6 +154,25 @@ Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`; `IZenoIndexVault`, `IV
 | `constructor(zenoIndexVault_)` | Binds factory as sole admin of router updates |
 | `setRouter` | Only `ZenoIndexVault`; updates `router` |
 | `executeSwap` | → `ISwapRouter(router).swap` |
+
+---
+
+### `src/AccessMaster.sol`
+
+**What it does:** Singleton role + treasury registry — the sole source of truth for who is admin, who is an operator, and where fees go, across the protocol. Wraps OpenZeppelin `AccessControl` directly — `ADMIN_ROLE` is an explicit alias for `DEFAULT_ADMIN_ROLE`, transferred in **one call** by the current super-admin via `setSuperAdmin` (grants the role to the new admin and revokes it from the caller atomically — no pending step, no acceptance call from the new admin, no delay). `OPERATOR_ROLE` is granted/revoked via named `addOperator` / `removeOperator` wrappers (OZ's own `grantRole` / `revokeRole` remain usable too — these don't disable them). `superAdmin()` / `isOperator()` are read-only aliases over the same OZ state, for the vocabulary `ZenoIndexVault.sol` already reads live via `IAccessMaster`. `ZenoIndexVault` reads roles + treasury live instead of storing them itself.
+
+| Function | Dependencies / calls |
+|---|---|
+| `constructor(initialSuperAdmin, initialTreasury)` | → OpenZeppelin `AccessControl._grantRole(ADMIN_ROLE, initialSuperAdmin)`; sets `treasury` |
+| `superAdmin` | Read alias over the tracked single `ADMIN_ROLE` holder |
+| `setSuperAdmin` | `onlyRole(ADMIN_ROLE)` — grants the new admin + revokes the caller in one call |
+| `isOperator` | → `hasRole(OPERATOR_ROLE, account)` (read alias) |
+| `addOperator` / `removeOperator` | `onlyRole(ADMIN_ROLE)` — `_grantRole` / `_revokeRole(OPERATOR_ROLE, account)` |
+| `treasury` | Public state, set at construction |
+| `setTreasury` | `onlyRole(ADMIN_ROLE)` |
+| *(inherited)* `grantRole` / `revokeRole(OPERATOR_ROLE, account)` | OZ `AccessControl`, admin-role-gated — still usable directly |
+
+Implements `IAccessMaster`.
 
 ---
 
@@ -209,6 +235,16 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 |---|---|
 | `constructor` | → `ERC20Minimal` |
 | `mint` / `burn` | → `ERC20Minimal._mint` / `_burn` (onlyVault) |
+
+---
+
+### `src/interfaces/IAccessMaster.sol`
+
+**What it does:** Read surface `AccessMaster.sol` exposes for role and treasury checks (`superAdmin`, `isOperator`, `treasury`).
+
+| Function | Dependencies / calls |
+|---|---|
+| `superAdmin` / `isOperator(account)` / `treasury` | Interface only — implemented by `AccessMaster` |
 
 ---
 

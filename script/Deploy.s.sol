@@ -6,6 +6,7 @@ import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
 import {NavCalculation} from "../src/NavCalculation.sol";
 import {SwapExecutor} from "../src/SwapExecutor.sol";
+import {AccessMaster} from "../src/AccessMaster.sol";
 
 /// @notice Production deploy for the clone-factory ZenoIndexVault.
 ///         Deploys Vault impl + NavCalculation + ZenoIndexVault + SwapExecutor, then wires
@@ -56,8 +57,10 @@ contract Deploy is Script {
 
         Vault vaultImpl = new Vault();
         NavCalculation navCalculation = new NavCalculation();
+        AccessMaster accessMaster = new AccessMaster(deployer, treasury);
 
-        ZenoIndexVault zenoIndexVault = new ZenoIndexVault(stablecoin, treasury, address(vaultImpl), priceOracle);
+        ZenoIndexVault zenoIndexVault =
+            new ZenoIndexVault(stablecoin, address(vaultImpl), priceOracle, address(accessMaster));
         SwapExecutor swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
         zenoIndexVault.setPricingModule(address(navCalculation));
@@ -73,7 +76,9 @@ contract Deploy is Script {
         console2.log("Vault (impl):            ", address(vaultImpl));
         console2.log("NavCalculation:          ", address(navCalculation));
         console2.log("SwapExecutor:            ", address(swapExecutor));
+        console2.log("AccessMaster:            ", address(accessMaster));
         console2.log("superAdmin:", zenoIndexVault.superAdmin());
+        console2.log("treasury:  ", zenoIndexVault.treasury());
         console2.log("usdcToken: ", zenoIndexVault.usdcToken());
     }
 
