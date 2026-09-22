@@ -8,14 +8,14 @@ import {AccessMaster} from "../src/AccessMaster.sol";
 
 /// @notice Production deploy for the clone-factory ZenoIndexVault.
 ///         Deploys Vault impl + AccessMaster + ZenoIndexVault, then wires an existing
-///         stablecoin (USDC or USDG) and swap router. NAV/valuation and swap execution
-///         (formerly NavCalculation.sol / SwapExecutor.sol) now live inside
-///         ZenoIndexVault.sol itself — set asset prices on it after deploy.
+///         stablecoin (USDC or USDG). NAV/valuation and swap execution (formerly
+///         NavCalculation.sol / SwapExecutor.sol) now live inside ZenoIndexVault.sol
+///         itself — set asset prices and the swap router (`setSwapRouter`) on it in a
+///         follow-up transaction after deploy; `executeSwap` reverts (NoRouter) until then.
 ///
 /// Required env:
 ///   PRIVATE_KEY   — deployer key (hex, with or without 0x)
 ///   STABLECOIN    — deposit token address (USDC or USDG)
-///   SWAP_ROUTER   — ISwapRouter address (e.g. UniswapV4Adapter)
 ///
 /// Optional env:
 ///   TREASURY      — fee treasury (defaults to deployer)
@@ -23,7 +23,7 @@ import {AccessMaster} from "../src/AccessMaster.sol";
 ///
 /// Robinhood Chain Testnet (chainId 46630):
 ///   1. Fund deployer with test ETH: https://faucet.testnet.chain.robinhood.com
-///   2. cp .env.example .env  # set PRIVATE_KEY, RH_RPC_URL, STABLECOIN, SWAP_ROUTER
+///   2. cp .env.example .env  # set PRIVATE_KEY, RH_RPC_URL, STABLECOIN
 ///   3. set -a && source .env && set +a
 ///   4. forge script script/Deploy.s.sol:Deploy \
 ///        --rpc-url $RH_RPC_URL --broadcast --chain-id 46630 -vvvv
@@ -37,16 +37,13 @@ contract Deploy is Script {
         address treasury = vm.envOr("TREASURY", deployer);
 
         address stablecoin = vm.envAddress("STABLECOIN");
-        address swapRouter = vm.envAddress("SWAP_ROUTER");
 
         require(stablecoin != address(0), "STABLECOIN=0");
-        require(swapRouter != address(0), "SWAP_ROUTER=0");
 
         console2.log("Chain id:", block.chainid);
         console2.log("Deployer:", deployer);
         console2.log("Treasury:", treasury);
         console2.log("Stablecoin (USDC/USDG):", stablecoin);
-        console2.log("Swap router:", swapRouter);
         console2.log("Deployer ETH balance:", deployer.balance);
 
         vm.startBroadcast(pk);
@@ -56,8 +53,6 @@ contract Deploy is Script {
 
         ZenoIndexVault zenoIndexVault =
             new ZenoIndexVault(stablecoin, address(vaultImpl), address(accessMaster));
-
-        zenoIndexVault.setSwapRouter(swapRouter);
 
         _registerOptionalAssets(zenoIndexVault);
 
