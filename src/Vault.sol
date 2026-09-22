@@ -37,9 +37,19 @@ interface IPriceOracleLike {
 ///         Reads NavCalculation/SwapExecutor addresses and role/asset-registry data live from `zenoIndexVault`
 ///         on every call — never caches them.
 contract Vault is Initializable, ReentrancyGuard, IVault {
+    // ── Enums ─────────────────────────────────────────────────────────────────
     enum FundType {
         Fixed,
         Dynamic
+    }
+
+    // ── Structs ───────────────────────────────────────────────────────────────
+    // ── Redeem state (per user) ──────────────────────────────────────────────────
+    struct RedeemState {
+        bool isRedeemActive;
+        uint8 numAssets;
+        uint256[20] assetAmountIn;
+        bool[20] assetSwapped;
     }
 
     // ── Immutable-in-spirit (set once in init) ─────────────────────────────────
@@ -65,11 +75,11 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
     // ── Asset slots (parallel arrays, index = slot) ──────────────────────────────
     uint8 public numAssets;
+    uint256 public totalPendingUsdc;
     uint64[20] internal _assetIds;
     uint16[20] internal _allocationBps;
     uint256[20] internal _usdcTargetAmount;
     uint256[20] internal _reservedAssets;
-    uint256 public totalPendingUsdc;
 
     // ── Path B: write-off state, keyed by assetId (not slot index — a written-off
     //    asset has no slot) ──────────────────────────────────────────────────────
@@ -78,15 +88,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     mapping(uint64 => bool) public pendingWriteOff;
     mapping(uint64 => bool) public pendingReactivate;
 
-    // ── Redeem state (per user) ──────────────────────────────────────────────────
-    struct RedeemState {
-        bool isRedeemActive;
-        uint8 numAssets;
-        uint256[20] assetAmountIn;
-        bool[20] assetSwapped;
-    }
-    mapping(address => RedeemState) internal redeemStates;
-    mapping(address => uint256) public redeemUsdcBal;
+    // ── Redeem accounting (per user) ──────────────────────────────────────────────
     uint256 public vaultRedeemEscrowTotal;
     /// @dev Count of RedeemStates with isRedeemActive == true. Every active RedeemState's
     ///      assetAmountIn/assetSwapped arrays are indexed against the slot layout as it
@@ -94,6 +96,21 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     ///      state (not just one with a nonzero reservation on the exact slot retiring), so
     ///      slot retirement is blocked outright while this is nonzero.
     uint256 public activeRedeemCount;
+    mapping(address => RedeemState) internal redeemStates;
+    mapping(address => uint256) public redeemUsdcBal;
+
+    // ── Modifiers ─────────────────────────────────────────────────────────────
+    modifier onlyManager() {
+        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isOperator(msg.sender)) {
+            revert NotVaultManager();
+        }
+        _;
+    }
+
+    modifier onlyZenoIndexVault() {
+        if (msg.sender != zenoIndexVault) revert NotZenoIndexVault();
+        _;
+    }
 
     // ── Events ────────────────────────────────────────────────────────────────
     event GenesisSeeded(address depositor, uint256 seedUsdc, uint256 baseline, uint256 sharesMinted);
@@ -145,23 +162,17 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     error AssetNotRegistered();
     error AssetNotActive();
 
-    modifier onlyManager() {
-        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isOperator(msg.sender)) {
-            revert NotVaultManager();
-        }
-        _;
-    }
-
-    modifier onlyZenoIndexVault() {
-        if (msg.sender != zenoIndexVault) revert NotZenoIndexVault();
-        _;
-    }
+    // ── Constructor ───────────────────────────────────────────────────────────
 
     /// @dev The implementation contract itself is never a live vault — disable its initializer
     ///      so nobody can call `init` directly on it (only on clones).
     constructor() {
         _disableInitializers();
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // External/public setters
+    // ══════════════════════════════════════════════════════════════════════════
 
     /// @notice Post-clone initializer — the clone's constructor-equivalent.
     function init(
@@ -215,9 +226,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         sharesToken = address(new ShareToken(name_, symbol_, address(this)));
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Control
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Control ───────────────────────────────────────────────────────────────
 
     function setPaused(bool paused_) external onlyManager {
         paused = paused_;
@@ -231,33 +240,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         adminLocked = locked;
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Views: asset slot getters
-    // ══════════════════════════════════════════════════════════════════════════
-
-    function assetIdAt(uint8 index) external view returns (uint64) {
-        require(index < numAssets, "IDX");
-        return _assetIds[index];
-    }
-
-    function allocationBpsAt(uint8 index) external view returns (uint16) {
-        require(index < numAssets, "IDX");
-        return _allocationBps[index];
-    }
-
-    function usdcTargetAmountAt(uint8 index) external view returns (uint256) {
-        require(index < numAssets, "IDX");
-        return _usdcTargetAmount[index];
-    }
-
-    function reservedAt(uint8 index) external view returns (uint256) {
-        require(index < numAssets, "IDX");
-        return _reservedAssets[index];
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Genesis + Deposit
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Genesis + Deposit ─────────────────────────────────────────────────────
 
     function genesisDeposit(uint256 baselineSharePrice_) external onlyManager nonReentrant {
         if (genesisDone) revert GenesisAlreadySeeded();
@@ -325,26 +308,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         emit Deposit(msg.sender, usdcAmount, netUsdc, fee.companyFee, fee.managerFee, sharesMinted);
     }
 
-    function previewDeposit(uint256 usdcAmount)
-        external
-        view
-        returns (uint256 sharesOut, uint256 netUsdc, uint256 companyFee, uint256 managerFee)
-    {
-        VaultMath.FeeSplit memory fee = VaultMath.computeFeeSplit(usdcAmount, depositFeeBps);
-        netUsdc = fee.netAmount;
-        companyFee = fee.companyFee;
-        managerFee = fee.managerFee;
-        if (!genesisDone || netUsdc == 0) return (0, netUsdc, companyFee, managerFee);
-        sharesOut = VaultMath.computeSharesToMint(netUsdc, totalShares, _sumNav(), totalPendingUsdc);
-    }
-
-    function totalNav() external view returns (uint256) {
-        return _sumNav() + totalPendingUsdc;
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Redeem / claim
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Redeem / claim ────────────────────────────────────────────────────────
 
     function requestRedeem(uint256 shares) external nonReentrant {
         if (shares == 0) revert ZeroAmount();
@@ -394,16 +358,6 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         emit RequestRedeem(msg.sender, shares, carve.usdcSlice);
     }
 
-    function getRedeemState(address user) external view returns (bool active, uint8 numAssets_, uint256 escrowUsdc) {
-        RedeemState storage rs = redeemStates[user];
-        return (rs.isRedeemActive, rs.numAssets, redeemUsdcBal[user]);
-    }
-
-    function getRedeemAssetAmount(address user, uint8 index) external view returns (uint256 amountIn, bool swapped) {
-        RedeemState storage rs = redeemStates[user];
-        return (rs.assetAmountIn[index], rs.assetSwapped[index]);
-    }
-
     function claim() external nonReentrant {
         RedeemState storage rs = redeemStates[msg.sender];
         if (!rs.isRedeemActive) revert RedeemInactive();
@@ -427,9 +381,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         emit Claim(msg.sender, grossUsdc, fee.companyFee, fee.managerFee, fee.netAmount);
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Inflow deployment leg
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Inflow deployment leg ─────────────────────────────────────────────────
 
     function swapUsdcToAsset(uint8 assetIndex, address[] calldata path, uint256 minAssetOut)
         external
@@ -458,9 +410,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         emit SwapUsdcToAsset(assetIndex, amount, assetOut);
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Redeem unwind leg
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Redeem unwind leg ─────────────────────────────────────────────────────
 
     function swapAssetToUsdc(uint8 assetIndex, address[] calldata path, uint256 minUsdcOut) external nonReentrant {
         RedeemState storage rs = redeemStates[msg.sender];
@@ -491,9 +441,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         emit SwapAssetToUsdc(msg.sender, assetIndex, assetAmount, usdcOut);
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Path A: rebalance
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Path A: rebalance ─────────────────────────────────────────────────────
 
     /// @notice Sets the FULL target asset list + weights (not a diff). Diffs internally
     ///         against current slots: shared assets are reweighted, new assets claim a free
@@ -638,36 +586,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         }
     }
 
-    /// @dev Every caller must ensure activeRedeemCount == 0 first (see executeWriteOff and
-    ///      executeRebalance) — compaction below shifts the last slot's data into `index`,
-    ///      which desyncs any RedeemState still indexed against the pre-compaction layout.
-    ///      Asserted here too as a last-line invariant, not just documented at call sites.
-    function _retireSlot(uint8 index) internal {
-        assert(activeRedeemCount == 0);
-        // Drop this slot's undeployed pending before compacting — otherwise totalPendingUsdc
-        // keeps earmarking USDC that can never be swapped via the retired assetId.
-        uint256 pending = _usdcTargetAmount[index];
-        if (pending > 0) {
-            totalPendingUsdc = totalPendingUsdc > pending ? totalPendingUsdc - pending : 0;
-        }
-
-        uint8 last = numAssets - 1;
-        if (index != last) {
-            _assetIds[index] = _assetIds[last];
-            _allocationBps[index] = _allocationBps[last];
-            _usdcTargetAmount[index] = _usdcTargetAmount[last];
-            _reservedAssets[index] = _reservedAssets[last];
-        }
-        _assetIds[last] = 0;
-        _allocationBps[last] = 0;
-        _usdcTargetAmount[last] = 0;
-        _reservedAssets[last] = 0;
-        numAssets = last;
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Path B: write-off (manager proposes, super-admin confirms via ZenoIndexVault relay)
-    // ══════════════════════════════════════════════════════════════════════════
+    // ── Path B: write-off (manager proposes, super-admin confirms via ZenoIndexVault relay) ──
 
     function proposeWriteOff(uint64 assetId) external onlyManager {
         pendingWriteOff[assetId] = true;
@@ -726,17 +645,36 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         emit ReactivateExecuted(assetId, restoredBalance);
     }
 
-    function _slotOf(uint64 assetId) internal view returns (uint8) {
-        uint8 n = numAssets;
-        for (uint8 i = 0; i < n; i++) {
-            if (_assetIds[i] == assetId) return i;
-        }
-        revert AssetNotFound();
-    }
+    // ══════════════════════════════════════════════════════════════════════════
+    // Private/internal setters
+    // ══════════════════════════════════════════════════════════════════════════
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Internals shared by 8a/8b/8c
-    // ══════════════════════════════════════════════════════════════════════════
+    /// @dev Every caller must ensure activeRedeemCount == 0 first (see executeWriteOff and
+    ///      executeRebalance) — compaction below shifts the last slot's data into `index`,
+    ///      which desyncs any RedeemState still indexed against the pre-compaction layout.
+    ///      Asserted here too as a last-line invariant, not just documented at call sites.
+    function _retireSlot(uint8 index) internal {
+        assert(activeRedeemCount == 0);
+        // Drop this slot's undeployed pending before compacting — otherwise totalPendingUsdc
+        // keeps earmarking USDC that can never be swapped via the retired assetId.
+        uint256 pending = _usdcTargetAmount[index];
+        if (pending > 0) {
+            totalPendingUsdc = totalPendingUsdc > pending ? totalPendingUsdc - pending : 0;
+        }
+
+        uint8 last = numAssets - 1;
+        if (index != last) {
+            _assetIds[index] = _assetIds[last];
+            _allocationBps[index] = _allocationBps[last];
+            _usdcTargetAmount[index] = _usdcTargetAmount[last];
+            _reservedAssets[index] = _reservedAssets[last];
+        }
+        _assetIds[last] = 0;
+        _allocationBps[last] = 0;
+        _usdcTargetAmount[last] = 0;
+        _reservedAssets[last] = 0;
+        numAssets = last;
+    }
 
     function _recordPendingTargets(uint256 netUsdc) internal {
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
@@ -748,24 +686,6 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             _usdcTargetAmount[i] += sliceUsdc;
             totalPendingUsdc += sliceUsdc;
         }
-    }
-
-    function _sumNav() internal view returns (uint256) {
-        uint8 n = numAssets;
-        uint64[] memory ids = new uint64[](n);
-        uint256[] memory reserved = new uint256[](n);
-        for (uint8 i = 0; i < n; i++) {
-            ids[i] = _assetIds[i];
-            reserved[i] = _reservedAssets[i];
-        }
-        address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
-        address oracleAddr = _priceOracle();
-        return INavCalculationLike(navCalculationAddr)
-            .sumNav(zenoIndexVault, oracleAddr, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
-    }
-
-    function _priceOracle() internal view returns (address) {
-        return IZenoIndexVault(zenoIndexVault).priceOracle();
     }
 
     function _payFees(address usdc, VaultMath.FeeSplit memory fee) internal {
@@ -785,5 +705,90 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             rs.assetSwapped[i] = false;
         }
         activeRedeemCount -= 1;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Getters
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Asset slot getters ────────────────────────────────────────────────────
+
+    function assetIdAt(uint8 index) external view returns (uint64) {
+        require(index < numAssets, "IDX");
+        return _assetIds[index];
+    }
+
+    function allocationBpsAt(uint8 index) external view returns (uint16) {
+        require(index < numAssets, "IDX");
+        return _allocationBps[index];
+    }
+
+    function usdcTargetAmountAt(uint8 index) external view returns (uint256) {
+        require(index < numAssets, "IDX");
+        return _usdcTargetAmount[index];
+    }
+
+    function reservedAt(uint8 index) external view returns (uint256) {
+        require(index < numAssets, "IDX");
+        return _reservedAssets[index];
+    }
+
+    // ── Deposit / NAV views ───────────────────────────────────────────────────
+
+    function previewDeposit(uint256 usdcAmount)
+        external
+        view
+        returns (uint256 sharesOut, uint256 netUsdc, uint256 companyFee, uint256 managerFee)
+    {
+        VaultMath.FeeSplit memory fee = VaultMath.computeFeeSplit(usdcAmount, depositFeeBps);
+        netUsdc = fee.netAmount;
+        companyFee = fee.companyFee;
+        managerFee = fee.managerFee;
+        if (!genesisDone || netUsdc == 0) return (0, netUsdc, companyFee, managerFee);
+        sharesOut = VaultMath.computeSharesToMint(netUsdc, totalShares, _sumNav(), totalPendingUsdc);
+    }
+
+    function totalNav() external view returns (uint256) {
+        return _sumNav() + totalPendingUsdc;
+    }
+
+    // ── Redeem state views ────────────────────────────────────────────────────
+
+    function getRedeemState(address user) external view returns (bool active, uint8 numAssets_, uint256 escrowUsdc) {
+        RedeemState storage rs = redeemStates[user];
+        return (rs.isRedeemActive, rs.numAssets, redeemUsdcBal[user]);
+    }
+
+    function getRedeemAssetAmount(address user, uint8 index) external view returns (uint256 amountIn, bool swapped) {
+        RedeemState storage rs = redeemStates[user];
+        return (rs.assetAmountIn[index], rs.assetSwapped[index]);
+    }
+
+    // ── Internal views ────────────────────────────────────────────────────────
+
+    function _sumNav() internal view returns (uint256) {
+        uint8 n = numAssets;
+        uint64[] memory ids = new uint64[](n);
+        uint256[] memory reserved = new uint256[](n);
+        for (uint8 i = 0; i < n; i++) {
+            ids[i] = _assetIds[i];
+            reserved[i] = _reservedAssets[i];
+        }
+        address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
+        address oracleAddr = _priceOracle();
+        return INavCalculationLike(navCalculationAddr)
+            .sumNav(zenoIndexVault, oracleAddr, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
+    }
+
+    function _priceOracle() internal view returns (address) {
+        return IZenoIndexVault(zenoIndexVault).priceOracle();
+    }
+
+    function _slotOf(uint64 assetId) internal view returns (uint8) {
+        uint8 n = numAssets;
+        for (uint8 i = 0; i < n; i++) {
+            if (_assetIds[i] == assetId) return i;
+        }
+        revert AssetNotFound();
     }
 }

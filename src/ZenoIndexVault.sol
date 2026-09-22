@@ -63,7 +63,8 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
     modifier onlySuperAdmin() {
-        if (msg.sender != IAccessMaster(accessMaster).superAdmin()) revert NotSuperAdmin();
+        if (msg.sender != IAccessMaster(accessMaster).superAdmin())
+            revert NotSuperAdmin();
         _;
     }
 
@@ -73,7 +74,8 @@ contract ZenoIndexVault is IZenoIndexVault {
     ///      emergency, module/oracle rotation, super-admin transfer).
     modifier onlySuperAdminOrOperator() {
         IAccessMaster roles = IAccessMaster(accessMaster);
-        if (msg.sender != roles.superAdmin() && !roles.isOperator(msg.sender)) revert NotSuperAdmin();
+        if (msg.sender != roles.superAdmin() && !roles.isOperator(msg.sender))
+            revert NotSuperAdmin();
         _;
     }
 
@@ -84,7 +86,11 @@ contract ZenoIndexVault is IZenoIndexVault {
     event SwapModuleSet(address indexed module, address indexed router);
     event AssetCreated(uint64 indexed assetId, address mint);
     event AssetActiveSet(uint64 indexed assetId, bool active);
-    event VaultCreated(uint64 indexed vaultId, address indexed clone, address manager);
+    event VaultCreated(
+        uint64 indexed vaultId,
+        address indexed clone,
+        address manager
+    );
     event WriteOffConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
     event ReactivateConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
     event PriceOracleSet(address indexed oracle);
@@ -104,10 +110,17 @@ contract ZenoIndexVault is IZenoIndexVault {
     error DuplicateMint();
 
     // ── Constructor ───────────────────────────────────────────────────────────
-    constructor(address usdcToken_, address vaultImplementation_, address priceOracle_, address accessMaster_) {
+    constructor(
+        address usdcToken_,
+        address vaultImplementation_,
+        address priceOracle_,
+        address accessMaster_
+    ) {
         if (
-            usdcToken_ == address(0) || vaultImplementation_ == address(0) || priceOracle_ == address(0)
-                || accessMaster_ == address(0)
+            usdcToken_ == address(0) ||
+            vaultImplementation_ == address(0) ||
+            priceOracle_ == address(0) ||
+            accessMaster_ == address(0)
         ) {
             revert ZeroAddress();
         }
@@ -124,11 +137,6 @@ contract ZenoIndexVault is IZenoIndexVault {
     function setEmergency(bool isEmergency_) external onlySuperAdmin {
         isEmergency = isEmergency_;
         emit EmergencySet(isEmergency_);
-    }
-
-    function setEtfCreationAuthority(address authority) external onlySuperAdmin {
-        etfCreationAuthority = authority;
-        emit EtfCreationAuthoritySet(authority);
     }
 
     /// @notice Rotates the price oracle used for NAV/rebalance valuation. Restricted to
@@ -166,11 +174,18 @@ contract ZenoIndexVault is IZenoIndexVault {
     // External/public setters — asset registry
     // ══════════════════════════════════════════════════════════════════════════
 
-    function createAsset(address mint) external onlySuperAdminOrOperator returns (uint64 assetId) {
+    function createAsset(
+        address mint
+    ) external onlySuperAdminOrOperator returns (uint64 assetId) {
         if (mint == address(0)) revert ZeroAddress();
         if (_mintRegistered[mint]) revert DuplicateMint();
         assetId = totalAssets;
-        _assets[assetId] = AssetInfo({assetId: assetId, mint: mint, active: true, exists: true});
+        _assets[assetId] = AssetInfo({
+            assetId: assetId,
+            mint: mint,
+            active: true,
+            exists: true
+        });
         _mintRegistered[mint] = true;
         totalAssets = assetId + 1;
         emit AssetCreated(assetId, mint);
@@ -179,7 +194,10 @@ contract ZenoIndexVault is IZenoIndexVault {
     /// @notice Toggles an asset's active flag — `active = false` is "remove" (assets are
     ///         never deleted, only deactivated, since existing vaults may still hold slots
     ///         referencing this assetId).
-    function setAssetActive(uint64 assetId, bool active) external onlySuperAdminOrOperator {
+    function setAssetActive(
+        uint64 assetId,
+        bool active
+    ) external onlySuperAdminOrOperator {
         if (!_assets[assetId].exists) revert AssetMissing();
         _assets[assetId].active = active;
         emit AssetActiveSet(assetId, active);
@@ -189,12 +207,17 @@ contract ZenoIndexVault is IZenoIndexVault {
     // External/public setters — ETF factory
     // ══════════════════════════════════════════════════════════════════════════
 
-    function createVault(CreateVaultParams calldata params) external returns (uint64 vaultId) {
+    function createVault(
+        CreateVaultParams calldata params
+    ) external returns (uint64 vaultId) {
         if (isEmergency) revert("EMERGENCY");
 
         address gate = etfCreationAuthority;
         if (gate == address(0)) revert CreationGateNotSet();
-        if (msg.sender != gate && msg.sender != IAccessMaster(accessMaster).superAdmin()) {
+        if (
+            msg.sender != gate &&
+            msg.sender != IAccessMaster(accessMaster).superAdmin()
+        ) {
             revert UnauthorizedGateAuthority();
         }
 
@@ -207,7 +230,8 @@ contract ZenoIndexVault is IZenoIndexVault {
             if (!a.exists) revert AssetMissing();
             if (!a.active) revert AssetInactive();
             for (uint256 j = i + 1; j < n; j++) {
-                if (params.assetIds[j] == params.assetIds[i]) revert AlreadyExists();
+                if (params.assetIds[j] == params.assetIds[i])
+                    revert AlreadyExists();
             }
         }
 
@@ -216,20 +240,21 @@ contract ZenoIndexVault is IZenoIndexVault {
         vaultClones[vaultId] = clone;
         totalVaults = vaultId + 1;
 
-        IVault(clone)
-            .init(
-                vaultId,
-                msg.sender,
-                params.feeRecipient == address(0) ? msg.sender : params.feeRecipient,
-                params.depositFeeBps,
-                params.redeemFeeBps,
-                params.assetIds,
-                params.allocationBps,
-                params.fundType,
-                params.maxShares,
-                params.name,
-                params.symbol
-            );
+        IVault(clone).init(
+            vaultId,
+            msg.sender,
+            params.feeRecipient == address(0)
+                ? msg.sender
+                : params.feeRecipient,
+            params.depositFeeBps,
+            params.redeemFeeBps,
+            params.assetIds,
+            params.allocationBps,
+            params.fundType,
+            params.maxShares,
+            params.name,
+            params.symbol
+        );
 
         emit VaultCreated(vaultId, clone, msg.sender);
     }
@@ -238,21 +263,30 @@ contract ZenoIndexVault is IZenoIndexVault {
     // External/public setters — Path B relay + emergency-lock relay
     // ══════════════════════════════════════════════════════════════════════════
 
-    function confirmWriteOff(uint64 vaultId, uint64 assetId) external onlySuperAdmin {
+    function confirmWriteOff(
+        uint64 vaultId,
+        uint64 assetId
+    ) external onlySuperAdmin {
         address clone = vaultClones[vaultId];
         if (clone == address(0)) revert VaultNotFound();
         IVault(clone).executeWriteOff(assetId);
         emit WriteOffConfirmed(vaultId, assetId);
     }
 
-    function confirmReactivate(uint64 vaultId, uint64 assetId) external onlySuperAdmin {
+    function confirmReactivate(
+        uint64 vaultId,
+        uint64 assetId
+    ) external onlySuperAdmin {
         address clone = vaultClones[vaultId];
         if (clone == address(0)) revert VaultNotFound();
         IVault(clone).executeReactivate(assetId);
         emit ReactivateConfirmed(vaultId, assetId);
     }
 
-    function setVaultEmergencyLock(uint64 vaultId, bool locked) external onlySuperAdmin {
+    function setVaultEmergencyLock(
+        uint64 vaultId,
+        bool locked
+    ) external onlySuperAdmin {
         address clone = vaultClones[vaultId];
         if (clone == address(0)) revert VaultNotFound();
         Vault(clone).setVaultEmergencyLock(locked);
@@ -279,7 +313,9 @@ contract ZenoIndexVault is IZenoIndexVault {
     // Getters — asset registry
     // ══════════════════════════════════════════════════════════════════════════
 
-    function getAsset(uint64 assetId) external view returns (uint64, address, bool, bool) {
+    function getAsset(
+        uint64 assetId
+    ) external view returns (uint64, address, bool, bool) {
         AssetInfo storage a = _assets[assetId];
         return (a.assetId, a.mint, a.active, a.exists);
     }
