@@ -4,11 +4,11 @@ pragma solidity ^0.8.13;
 import {Script, console2} from "forge-std/Script.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
-import {Pricing} from "../src/Pricing.sol";
+import {NavCalculation} from "../src/NavCalculation.sol";
 import {SwapExecutor} from "../src/SwapExecutor.sol";
 
 /// @notice Production deploy for the clone-factory ZenoIndexVault.
-///         Deploys Vault impl + Pricing + ZenoIndexVault + SwapExecutor, then wires
+///         Deploys Vault impl + NavCalculation + ZenoIndexVault + SwapExecutor, then wires
 ///         an existing stablecoin (USDC or USDG), price oracle, and swap router.
 ///
 /// Required env:
@@ -55,12 +55,12 @@ contract Deploy is Script {
         vm.startBroadcast(pk);
 
         Vault vaultImpl = new Vault();
-        Pricing pricing = new Pricing();
+        NavCalculation navCalculation = new NavCalculation();
 
         ZenoIndexVault zenoIndexVault = new ZenoIndexVault(stablecoin, treasury, address(vaultImpl), priceOracle);
         SwapExecutor swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
-        zenoIndexVault.setPricingModule(address(pricing));
+        zenoIndexVault.setPricingModule(address(navCalculation));
         zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(swapRouter);
 
@@ -71,7 +71,7 @@ contract Deploy is Script {
         console2.log("--- deployed ---");
         console2.log("ZenoIndexVault (factory):", address(zenoIndexVault));
         console2.log("Vault (impl):            ", address(vaultImpl));
-        console2.log("Pricing:                 ", address(pricing));
+        console2.log("NavCalculation:          ", address(navCalculation));
         console2.log("SwapExecutor:            ", address(swapExecutor));
         console2.log("superAdmin:", zenoIndexVault.superAdmin());
         console2.log("usdcToken: ", zenoIndexVault.usdcToken());

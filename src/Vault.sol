@@ -18,7 +18,7 @@ interface ISwapExecutorLike {
         returns (uint256);
 }
 
-interface IPricingLike {
+interface INavCalculationLike {
     function sumNav(
         address zenoIndexVaultAddr,
         address priceOracle,
@@ -34,7 +34,7 @@ interface IPriceOracleLike {
 }
 
 /// @notice ERC-1167 clone implementation — one instance per ETF. Owns all per-vault storage.
-///         Reads Pricing/SwapExecutor addresses and role/asset-registry data live from `zenoIndexVault`
+///         Reads NavCalculation/SwapExecutor addresses and role/asset-registry data live from `zenoIndexVault`
 ///         on every call — never caches them.
 contract Vault is Initializable, ReentrancyGuard, IVault {
     enum FundType {
@@ -535,7 +535,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
             // Reject an assetId that was never registered on ZenoIndexVault.sol (or was
             // deactivated) — accepting it here would store a slot whose getAsset(id) later
-            // resolves to mint == address(0), and every NAV read (_sumNav -> Pricing.sumNav
+            // resolves to mint == address(0), and every NAV read (_sumNav -> NavCalculation.sumNav
             // -> ERC20Minimal(address(0)).balanceOf(...)) then reverts, permanently
             // bricking deposit/redeem/rebalance for the whole vault.
             (,, bool active, bool exists) = IZenoIndexVault(zenoIndexVault).getAsset(id);
@@ -758,9 +758,9 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             ids[i] = _assetIds[i];
             reserved[i] = _reservedAssets[i];
         }
-        address pricingAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
+        address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
         address oracleAddr = _priceOracle();
-        return IPricingLike(pricingAddr)
+        return INavCalculationLike(navCalculationAddr)
             .sumNav(zenoIndexVault, oracleAddr, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
     }
 

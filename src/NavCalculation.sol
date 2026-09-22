@@ -8,7 +8,7 @@ import {ERC20Minimal} from "./tokens/ERC20Minimal.sol";
 /// @notice Singleton NAV/valuation module, called cross-contract by every Vault.sol clone.
 ///         Holds no per-vault storage — every input is passed in or read live from the
 ///         clone/ZenoIndexVault at call time.
-contract Pricing {
+contract NavCalculation {
     error NoPrice();
 
     /// @notice Sums the USD (USDC 6-decimal) value of `vaultClone`'s free (non-reserved)

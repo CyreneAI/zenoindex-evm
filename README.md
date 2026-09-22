@@ -16,7 +16,7 @@ flowchart TB
   end
 
   subgraph Singletons["Shared modules"]
-    P["Pricing.sol"]
+    P["NavCalculation.sol"]
     SM["SwapExecutor.sol"]
   end
 
@@ -46,7 +46,7 @@ flowchart TB
 
   V -->|new ShareToken| ST
   V -->|IZenoIndexVault reads| ZIV
-  V -->|IPricingLike.sumNav| P
+  V -->|INavCalculationLike.sumNav| P
   V -->|ISwapExecutorLike.executeSwap| SM
   V --> VM
   V --> C
@@ -68,7 +68,7 @@ flowchart TB
 
 Production call path (simplified):
 
-`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `Pricing.sumNav` + `SwapExecutor.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock) + `IPriceOracle`.
+`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `NavCalculation.sumNav` + `SwapExecutor.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock) + `IPriceOracle`.
 
 ---
 
@@ -78,7 +78,7 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 
 ### `src/ZenoIndexVault.sol`
 
-**What it does:** Root factory and registry — super-admin, treasury, emergency flag, asset registry, Pricing/SwapExecutor pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays.
+**What it does:** Root factory and registry — super-admin, treasury, emergency flag, asset registry, NavCalculation/SwapExecutor pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays.
 
 | Function | Dependencies / calls |
 |---|---|
@@ -86,7 +86,7 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 | `setPendingSuperAdmin` / `acceptSuperAdmin` | Internal admin transfer |
 | `updateTreasury` / `setEmergency` / `setEtfCreationAuthority` / `setOperator` | Super-admin config |
 | `setPriceOracle` | Rotates oracle address used by vaults |
-| `setPricingModule` | Stores `Pricing` singleton address |
+| `setPricingModule` | Stores `NavCalculation` singleton address |
 | `setSwapModule` | Stores `SwapExecutor` singleton address |
 | `setSwapRouter` | → `ISwapModAdmin(swapModule).setRouter` (`SwapExecutor`) |
 | `createAsset` / `setAssetActive` / `getAsset` | Asset registry storage |
@@ -109,7 +109,7 @@ Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `pricin
 | `setVaultEmergencyLock` | Called only by `ZenoIndexVault` |
 | `assetIdAt` / `allocationBpsAt` / `usdcTargetAmountAt` / `reservedAt` | Slot getters |
 | `genesisDeposit` | → `VaultMath.calculateReverseGenesisShares`; `Constants.GENESIS_SEED_USDC`; `IZenoIndexVault.usdcToken`; `ERC20Minimal.transferFrom`; `ShareToken.mint`; `_recordPendingTargets` |
-| `deposit` | → `_sumNav` → `Pricing.sumNav`; `VaultMath.computeSharesToMint` / `computeUsdcForShares` / `computeFeeSplit`; `ERC20Minimal.transferFrom`; `_payFees`; `ShareToken.mint`; `_recordPendingTargets` |
+| `deposit` | → `_sumNav` → `NavCalculation.sumNav`; `VaultMath.computeSharesToMint` / `computeUsdcForShares` / `computeFeeSplit`; `ERC20Minimal.transferFrom`; `_payFees`; `ShareToken.mint`; `_recordPendingTargets` |
 | `previewDeposit` | → `VaultMath.computeFeeSplit` / `computeSharesToMint`; `_sumNav` |
 | `totalNav` | → `_sumNav` + `totalPendingUsdc` |
 | `requestRedeem` | → `IZenoIndexVault.getAsset`; `ERC20Minimal.balanceOf`; `VaultMath.computeRedeemSwapAmounts` / `computePendingCarve`; `ShareToken.burn` |
@@ -122,13 +122,13 @@ Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `pricin
 | `proposeWriteOff` / `proposeReactivate` | Manager proposes Path B |
 | `executeWriteOff` / `executeReactivate` | Called by `ZenoIndexVault`; → oracle / `ERC20Minimal` / `_retireSlot` |
 
-Internal helpers of note: `_sumNav` → `Pricing.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `ERC20Minimal.transfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`.
+Internal helpers of note: `_sumNav` → `NavCalculation.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `ERC20Minimal.transfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`.
 
 Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`; `IZenoIndexVault`, `IVault`, `ISwapRouter`; `ERC20Minimal`, `ShareToken`, `VaultMath`, `Constants`.
 
 ---
 
-### `src/Pricing.sol`
+### `src/NavCalculation.sol`
 
 **What it does:** Stateless NAV valuation singleton — sums free (non-reserved) vault balances in USDC 6-decimal units.
 

@@ -12,7 +12,7 @@ interface ISwapModAdmin {
 }
 
 /// @notice Root contract: super-admin, treasury, emergency flag, asset registry, the
-///         Pricing/SwapExecutor address registry, and the ERC-1167 clone factory for vaults.
+///         NavCalculation/SwapExecutor address registry, and the ERC-1167 clone factory for vaults.
 ///         No `init_global_state` — a real constructor does that job.
 contract ZenoIndexVault is IZenoIndexVault {
     struct CreateVaultParams {
@@ -93,6 +93,15 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     modifier onlySuperAdmin() {
         if (msg.sender != superAdmin) revert NotSuperAdmin();
+        _;
+    }
+
+    /// @dev Super-admin or any account flagged via setOperator — used for asset-registry
+    ///      actions (createAsset / setAssetActive) so operators can add/remove assets
+    ///      without needing super-admin's other, more sensitive powers (treasury, emergency,
+    ///      module/oracle rotation, super-admin transfer).
+    modifier onlySuperAdminOrOperator() {
+        if (msg.sender != superAdmin && !isOperator[msg.sender]) revert NotSuperAdmin();
         _;
     }
 
@@ -187,7 +196,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     // Asset registry
     // ══════════════════════════════════════════════════════════════════════════
 
-    function createAsset(address mint) external onlySuperAdmin returns (uint64 assetId) {
+    function createAsset(address mint) external onlySuperAdminOrOperator returns (uint64 assetId) {
         if (mint == address(0)) revert ZeroAddress();
         if (_mintRegistered[mint]) revert DuplicateMint();
         assetId = totalAssets;
@@ -197,7 +206,10 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit AssetCreated(assetId, mint);
     }
 
-    function setAssetActive(uint64 assetId, bool active) external onlySuperAdmin {
+    /// @notice Toggles an asset's active flag — `active = false` is "remove" (assets are
+    ///         never deleted, only deactivated, since existing vaults may still hold slots
+    ///         referencing this assetId).
+    function setAssetActive(uint64 assetId, bool active) external onlySuperAdminOrOperator {
         if (!_assets[assetId].exists) revert AssetMissing();
         _assets[assetId].active = active;
         emit AssetActiveSet(assetId, active);

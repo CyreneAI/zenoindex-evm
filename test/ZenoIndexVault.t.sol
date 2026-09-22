@@ -4,7 +4,7 @@ pragma solidity ^0.8.13;
 import {Test} from "forge-std/Test.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
-import {Pricing} from "../src/Pricing.sol";
+import {NavCalculation} from "../src/NavCalculation.sol";
 import {SwapExecutor} from "../src/SwapExecutor.sol";
 import {Constants} from "../src/libraries/Constants.sol";
 import {ShareToken} from "../src/tokens/ShareToken.sol";
@@ -22,7 +22,7 @@ import {IHooks} from "v4-core/interfaces/IHooks.sol";
 contract ZenoIndexVaultTest is Test {
     ZenoIndexVault internal zenoIndexVault;
     Vault internal vaultImpl;
-    Pricing internal pricing;
+    NavCalculation internal navCalculation;
     SwapExecutor internal swapExecutor;
     MockERC20 internal usdc;
     MockERC20 internal tokenA;
@@ -60,11 +60,11 @@ contract ZenoIndexVaultTest is Test {
         router = new UniswapV4Adapter(address(poolManager), dexAdmin);
 
         vaultImpl = new Vault();
-        pricing = new Pricing();
+        navCalculation = new NavCalculation();
         zenoIndexVault = new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(oracle));
         swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
-        zenoIndexVault.setPricingModule(address(pricing));
+        zenoIndexVault.setPricingModule(address(navCalculation));
         zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(address(router));
         zenoIndexVault.setEtfCreationAuthority(manager);
@@ -976,7 +976,7 @@ contract ZenoIndexVaultTest is Test {
     ///      previously let anyone create a vault.
     function test_CreateVault_RevertsWhenCreationGateUnset() public {
         ZenoIndexVault freshFactory = new ZenoIndexVault(address(usdc), treasury, address(vaultImpl), address(oracle));
-        freshFactory.setPricingModule(address(pricing));
+        freshFactory.setPricingModule(address(navCalculation));
 
         uint64[] memory ids = new uint64[](1);
         ids[0] = freshFactory.createAsset(address(tokenA));

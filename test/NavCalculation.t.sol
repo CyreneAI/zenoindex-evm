@@ -2,11 +2,11 @@
 pragma solidity ^0.8.13;
 
 import {Test} from "forge-std/Test.sol";
-import {Pricing} from "../src/Pricing.sol";
+import {NavCalculation} from "../src/NavCalculation.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {MockPriceOracle} from "../src/mocks/MockPriceOracle.sol";
 
-/// @notice Minimal stand-in exposing just the IZenoIndexVault surface Pricing.sol needs.
+/// @notice Minimal stand-in exposing just the IZenoIndexVault surface NavCalculation.sol needs.
 contract FakeZenoIndexVault {
     address public usdcToken;
     mapping(uint64 => address) internal mints;
@@ -24,8 +24,8 @@ contract FakeZenoIndexVault {
     }
 }
 
-contract PricingTest is Test {
-    Pricing internal pricing;
+contract NavCalculationTest is Test {
+    NavCalculation internal navCalculation;
     FakeZenoIndexVault internal zenoIndexVault;
     MockERC20 internal usdc;
     MockERC20 internal weth;
@@ -33,7 +33,7 @@ contract PricingTest is Test {
     address internal vaultClone = address(0xC10E);
 
     function setUp() public {
-        pricing = new Pricing();
+        navCalculation = new NavCalculation();
         usdc = new MockERC20("USD Coin", "USDC", 6);
         weth = new MockERC20("Wrapped Ether", "WETH", 18);
         oracle = new MockPriceOracle();
@@ -55,7 +55,8 @@ contract PricingTest is Test {
         reserved[0] = 0;
         reserved[1] = 0;
 
-        uint256 total = pricing.sumNav(address(zenoIndexVault), address(oracle), vaultClone, ids, reserved, 400_000);
+        uint256 total =
+            navCalculation.sumNav(address(zenoIndexVault), address(oracle), vaultClone, ids, reserved, 400_000);
         // USDC leg: 1_000_000 - 400_000 pending = 600_000
         // WETH leg: 1e18 * $2 = 2_000_000 (6dp USDC)
         assertEq(total, 600_000 + 2_000_000);
@@ -69,7 +70,7 @@ contract PricingTest is Test {
         uint256[] memory reserved = new uint256[](1);
         reserved[0] = 0.5e18; // half reserved for pending redemption
 
-        uint256 total = pricing.sumNav(address(zenoIndexVault), address(oracle), vaultClone, ids, reserved, 0);
+        uint256 total = navCalculation.sumNav(address(zenoIndexVault), address(oracle), vaultClone, ids, reserved, 0);
         assertEq(total, 1_000_000); // 0.5 WETH free * $2
     }
 
@@ -77,6 +78,6 @@ contract PricingTest is Test {
         uint64[] memory ids = new uint64[](2);
         uint256[] memory reserved = new uint256[](1);
         vm.expectRevert(bytes("LEN"));
-        pricing.sumNav(address(zenoIndexVault), address(oracle), vaultClone, ids, reserved, 0);
+        navCalculation.sumNav(address(zenoIndexVault), address(oracle), vaultClone, ids, reserved, 0);
     }
 }
