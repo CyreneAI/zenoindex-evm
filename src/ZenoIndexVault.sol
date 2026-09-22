@@ -6,14 +6,14 @@ import {Vault} from "./Vault.sol";
 import {IZenoIndexVault} from "./interfaces/IZenoIndexVault.sol";
 import {IVault} from "./interfaces/IVault.sol";
 import {IAccessMaster} from "./interfaces/IAccessMaster.sol";
+import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
+import {ERC20Minimal} from "./tokens/ERC20Minimal.sol";
 import {Constants} from "./libraries/Constants.sol";
 
-interface ISwapModAdmin {
-    function setRouter(address newRouter) external;
-}
-
-/// @notice Root contract: emergency flag, asset registry, the NavCalculation/SwapExecutor
-///         address registry, and the ERC-1167 clone factory for vaults. Super-admin,
+/// @notice Root contract: emergency flag, asset registry, NAV/valuation (formerly
+///         NavCalculation.sol), swap execution (formerly SwapExecutor.sol), and the
+///         ERC-1167 clone factory for vaults — all in one module now, so every Vault.sol
+///         clone has exactly one external address to call back into. Super-admin,
 ///         operator roles, and treasury are NOT stored here — they live in AccessMaster.sol
 ///         (set once at construction) and are read live via IAccessMaster, so there is
 ///         exactly one place across the whole protocol that answers "who is admin /
@@ -48,8 +48,14 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     // ── Singleton registry ────────────────────────────────────────────────────
     address public vaultImplementation;
-    address public pricingModule;
-    address public swapModule;
+
+    // ── NAV / valuation (formerly NavCalculation.sol) ────────────────────────────
+    /// @dev priceUsdcPerUnit helpers: usdcValue = amount * priceNum / priceDen
+    mapping(address => uint256) public priceNum; // USDC out (6 dec)
+    mapping(address => uint256) public priceDen; // token in (raw units)
+
+    // ── Swap execution (formerly SwapExecutor.sol) ───────────────────────────────
+    address public router;
 
     // ── Asset registry ────────────────────────────────────────────────────────
     uint64 public totalAssets;
@@ -80,8 +86,8 @@ contract ZenoIndexVault is IZenoIndexVault {
 
     // ── Events ────────────────────────────────────────────────────────────────
     event EmergencySet(bool isEmergency);
-    event PricingModuleSet(address indexed module);
-    event SwapModuleSet(address indexed module, address indexed router);
+    event PriceSet(address indexed token, uint256 usdcOut, uint256 tokenIn);
+    event RouterUpdated(address indexed oldRouter, address indexed newRouter);
     event AssetCreated(uint64 indexed assetId, address mint);
     event AssetActiveSet(uint64 indexed assetId, bool active);
     event VaultCreated(
@@ -103,6 +109,8 @@ contract ZenoIndexVault is IZenoIndexVault {
     error InvalidAllocation();
     error VaultNotFound();
     error DuplicateMint();
+    error NoPrice();
+    error NoRouter();
 
     // ── Constructor ───────────────────────────────────────────────────────────
     constructor(address usdcToken_, address vaultImplementation_, address accessMaster_) {
@@ -123,26 +131,29 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit EmergencySet(isEmergency_);
     }
 
-    function setPricingModule(address module) external onlySuperAdmin {
-        if (module == address(0)) revert ZeroAddress();
-        pricingModule = module;
-        emit PricingModuleSet(module);
+    /// @notice Sets raw price: `usdcOut` USDC (6 dec) for `tokenIn` raw token units.
+    function setPrice(address token, uint256 usdcOut, uint256 tokenIn) external onlySuperAdmin {
+        if (token == address(0) || tokenIn == 0) revert ZeroAddress();
+        priceNum[token] = usdcOut;
+        priceDen[token] = tokenIn;
+        emit PriceSet(token, usdcOut, tokenIn);
     }
 
-    /// @notice Sets SwapExecutor.sol itself (rare) — for switching the DEX-execution router
-    ///         address that clones use day to day, use `setSwapRouter` instead.
-    function setSwapModule(address module) external onlySuperAdmin {
-        if (module == address(0)) revert ZeroAddress();
-        swapModule = module;
-        emit SwapModuleSet(module, address(0));
+    /// @dev Convenience: USD price for 1 whole token (accounts for decimals).
+    ///      e.g. token 6 dec at $2 → setPriceWhole(token, 2_000_000)
+    function setPriceWhole(address token, uint256 usdcPerWholeToken) external onlySuperAdmin {
+        if (token == address(0)) revert ZeroAddress();
+        uint8 dec = ERC20Minimal(token).decimals();
+        priceNum[token] = usdcPerWholeToken;
+        priceDen[token] = 10 ** uint256(dec);
+        emit PriceSet(token, usdcPerWholeToken, 10 ** uint256(dec));
     }
 
-    /// @notice Relays to SwapExecutor.sol's `setRouter`, which is itself gated to only accept
-    ///         calls from this contract.
-    function setSwapRouter(address router) external onlySuperAdmin {
-        if (router == address(0)) revert ZeroAddress();
-        ISwapModAdmin(swapModule).setRouter(router);
-        emit SwapModuleSet(swapModule, router);
+    /// @notice Sets the DEX-execution router address that clones swap through day to day.
+    function setSwapRouter(address newRouter) external onlySuperAdmin {
+        if (newRouter == address(0)) revert ZeroAddress();
+        emit RouterUpdated(router, newRouter);
+        router = newRouter;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -259,6 +270,22 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // External/public — swap execution (formerly SwapExecutor.sol)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Executes a swap along `path` through the currently-registered router.
+    /// @dev `from` (the calling Vault.sol clone) must have approved `router` directly —
+    ///      this contract never custodies the tokens, it only orchestrates the call.
+    function executeSwap(address[] calldata path, uint256 amountIn, uint256 minAmountOut, address from, address to)
+        external
+        returns (uint256 amountOut)
+    {
+        address r = router;
+        if (r == address(0)) revert NoRouter();
+        amountOut = ISwapRouter(r).swap(path, amountIn, minAmountOut, from, to);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Getters — roles + treasury, read live from AccessMaster.sol, never cached
     // (IZenoIndexVault surface)
     // ══════════════════════════════════════════════════════════════════════════
@@ -284,5 +311,54 @@ contract ZenoIndexVault is IZenoIndexVault {
     ) external view returns (uint64, address, bool, bool) {
         AssetInfo storage a = _assets[assetId];
         return (a.assetId, a.mint, a.active, a.exists);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Getters — NAV / valuation (formerly NavCalculation.sol)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Values `amount` of `token` in USDC 6-decimal units.
+    ///         USDC/USDG (the factory deposit token) is always 1:1; other tokens use the
+    ///         price table maintained on this contract.
+    function valueUsdc(address token, uint256 amount) external view returns (uint256) {
+        if (token == usdcToken) return amount;
+        return _quote(token, amount);
+    }
+
+    /// @notice Sums the USD (USDC 6-decimal) value of `vaultClone`'s free (non-reserved)
+    ///         balances across `assetIds`.
+    /// @param vaultClone The Vault clone whose balances are valued
+    /// @param assetIds Current asset slot ids (active + winding-down; never written-off)
+    /// @param reservedAmounts Per-asset reserved amounts, same order as `assetIds`
+    /// @param excludeFromUsdcLeg Amount to subtract from the raw USDC balance before valuing
+    function sumNav(
+        address vaultClone,
+        uint64[] calldata assetIds,
+        uint256[] calldata reservedAmounts,
+        uint256 excludeFromUsdcLeg
+    ) external view returns (uint256 total) {
+        address usdc = usdcToken;
+        uint256 n = assetIds.length;
+        require(reservedAmounts.length == n, "LEN");
+
+        for (uint256 i = 0; i < n; i++) {
+            address mint = _assets[assetIds[i]].mint;
+            uint256 bal = ERC20Minimal(mint).balanceOf(vaultClone);
+            uint256 free = bal > reservedAmounts[i] ? bal - reservedAmounts[i] : 0;
+
+            if (mint == usdc) {
+                free = free > excludeFromUsdcLeg ? free - excludeFromUsdcLeg : 0;
+                total += free; // $1 peg
+            } else {
+                if (free == 0) continue;
+                total += _quote(mint, free);
+            }
+        }
+    }
+
+    function _quote(address token, uint256 amount) internal view returns (uint256) {
+        uint256 den = priceDen[token];
+        if (den == 0) revert NoPrice();
+        return (amount * priceNum[token]) / den;
     }
 }

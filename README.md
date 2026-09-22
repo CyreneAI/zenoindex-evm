@@ -16,14 +16,11 @@ flowchart TB
   end
 
   subgraph Singletons["Shared modules"]
-    P["NavCalculation.sol"]
-    SM["SwapExecutor.sol"]
     AM["AccessMaster.sol"]
   end
 
-  subgraph Adapters["Adapters / oracles"]
+  subgraph Adapters["Adapters"]
     V4["UniswapV4Adapter.sol"]
-    OR["IPriceOracle"]
     SR["ISwapRouter"]
   end
 
@@ -39,30 +36,24 @@ flowchart TB
   end
 
   ZIV -->|Clones.clone + IVault.init| V
-  ZIV -->|setPricingModule| P
-  ZIV -->|setSwapModule / setSwapRouter| SM
+  ZIV -->|setSwapRouter| SR
+  ZIV -->|setPrice / setPriceWhole, sumNav / valueUsdc| E20
   ZIV -->|IAccessMaster reads, set at construction| AM
-  ZIV -->|registers| OR
   ZIV --> C
   ZIV --> OZ
 
   AM -->|extends| OZ
 
   V -->|new ShareToken| ST
-  V -->|IZenoIndexVault reads| ZIV
-  V -->|INavCalculationLike.sumNav| P
-  V -->|ISwapExecutorLike.executeSwap| SM
+  V -->|IZenoIndexVault reads: getAsset / usdcToken / router / sumNav / valueUsdc / executeSwap| ZIV
   V --> VM
   V --> C
   V --> E20
   V --> OZ
 
   ST --> E20
-  P -->|getAsset / usdcToken| ZIV
-  P -->|quoteUsdc| OR
-  P --> E20
 
-  SM -->|ISwapRouter.swap| SR
+  ZIV -->|ISwapRouter.swap, via executeSwap| SR
   V4 -.->|implements| SR
   V4 --> E20
   V4 --> V4C
@@ -72,7 +63,9 @@ flowchart TB
 
 Production call path (simplified):
 
-`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `NavCalculation.sumNav` + `SwapExecutor.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock) + `IPriceOracle`.
+`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `ZenoIndexVault.sumNav` + `ZenoIndexVault.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock).
+
+NAV/valuation (formerly `NavCalculation.sol`) and swap execution (formerly `SwapExecutor.sol`) are no longer separate singleton contracts — both now live inside `ZenoIndexVault.sol` itself, so every `Vault.sol` clone has exactly one external module address to call back into.
 
 Roles and treasury are set once at `ZenoIndexVault`'s construction (an `AccessMaster` address) and read live via `IAccessMaster` on every permission check — `ZenoIndexVault` itself holds no admin/operator/treasury storage.
 
@@ -84,24 +77,25 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 
 ### `src/ZenoIndexVault.sol`
 
-**What it does:** Root factory and registry — emergency flag, asset registry, NavCalculation/SwapExecutor pointers, ERC-1167 vault cloning, and Path B write-off / reactivate relays. Holds no admin/operator/treasury storage of its own — `superAdmin` / `isOperator` / `treasury` are read live from `AccessMaster` (set once at construction) via `IAccessMaster`.
+**What it does:** Root factory and registry — emergency flag, asset registry, NAV/valuation (formerly `NavCalculation.sol`), swap execution (formerly `SwapExecutor.sol`), ERC-1167 vault cloning, and Path B write-off / reactivate relays. Holds no admin/operator/treasury storage of its own — `superAdmin` / `isOperator` / `treasury` are read live from `AccessMaster` (set once at construction) via `IAccessMaster`.
 
 | Function | Dependencies / calls |
 |---|---|
-| `constructor(usdcToken_, vaultImplementation_, priceOracle_, accessMaster_)` | Sets registry state + binds `accessMaster` |
+| `constructor(usdcToken_, vaultImplementation_, accessMaster_)` | Sets registry state + binds `accessMaster` |
 | `superAdmin` / `isOperator` / `treasury` | → `IAccessMaster(accessMaster)` passthrough views |
 | `setEmergency` | Super-admin config (`onlySuperAdmin` → `AccessMaster`) |
-| `setPriceOracle` | Rotates oracle address used by vaults |
-| `setPricingModule` | Stores `NavCalculation` singleton address |
-| `setSwapModule` | Stores `SwapExecutor` singleton address |
-| `setSwapRouter` | → `ISwapModAdmin(swapModule).setRouter` (`SwapExecutor`) |
+| `setPrice` / `setPriceWhole` | Sets the per-token USDC price table (`onlySuperAdmin`) |
+| `setSwapRouter` | Sets the `ISwapRouter` address clones swap through (`onlySuperAdmin`) |
 | `createAsset` / `setAssetActive` | Asset registry storage (`onlySuperAdminOrOperator` → `AccessMaster`) |
 | `getAsset` | Asset registry read |
+| `valueUsdc` | Values a token amount in USDC 6-decimal units (1:1 for `usdcToken`, price table otherwise) |
+| `sumNav` | Sums a vault clone's free (non-reserved) balances in USDC 6-decimal units |
+| `executeSwap` | → `ISwapRouter(router).swap` — orchestrates a clone's swap without custodying tokens |
 | `createVault` | → `Constants.MAX_ASSETS`; `Clones.clone` (OpenZeppelin); `IVault(clone).init` (`Vault`) |
 | `confirmWriteOff` / `confirmReactivate` | → `IVault(clone).executeWriteOff` / `executeReactivate` |
 | `setVaultEmergencyLock` | → `Vault(clone).setVaultEmergencyLock` |
 
-Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `pricingModule`, `swapModule`, `priceOracle`, `getAsset`, …).
+Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `router`, `getAsset`, `valueUsdc`, `sumNav`, …).
 
 ---
 
@@ -116,44 +110,22 @@ Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `pricin
 | `setVaultEmergencyLock` | Called only by `ZenoIndexVault` |
 | `assetIdAt` / `allocationBpsAt` / `usdcTargetAmountAt` / `reservedAt` | Slot getters |
 | `genesisDeposit` | → `VaultMath.calculateReverseGenesisShares`; `Constants.GENESIS_SEED_USDC`; `IZenoIndexVault.usdcToken`; `ERC20Minimal.transferFrom`; `ShareToken.mint`; `_recordPendingTargets` |
-| `deposit` | → `_sumNav` → `NavCalculation.sumNav`; `VaultMath.computeSharesToMint` / `computeUsdcForShares` / `computeFeeSplit`; `ERC20Minimal.transferFrom`; `_payFees`; `ShareToken.mint`; `_recordPendingTargets` |
+| `deposit` | → `_sumNav` → `ZenoIndexVault.sumNav`; `VaultMath.computeSharesToMint` / `computeUsdcForShares` / `computeFeeSplit`; `ERC20Minimal.transferFrom`; `_payFees`; `ShareToken.mint`; `_recordPendingTargets` |
 | `previewDeposit` | → `VaultMath.computeFeeSplit` / `computeSharesToMint`; `_sumNav` |
 | `totalNav` | → `_sumNav` + `totalPendingUsdc` |
 | `requestRedeem` | → `IZenoIndexVault.getAsset`; `ERC20Minimal.balanceOf`; `VaultMath.computeRedeemSwapAmounts` / `computePendingCarve`; `ShareToken.burn` |
 | `getRedeemState` / `getRedeemAssetAmount` | Redeem views |
 | `claim` | → `VaultMath.computeFeeSplit`; `_payFees`; `ERC20Minimal.transfer`; `_resetRedeem` |
-| `swapUsdcToAsset` | → `IZenoIndexVault.getAsset` / `usdcToken` / `swapModule`; `ISwapExecutorLike.router` / `executeSwap`; `ERC20Minimal.approve` |
+| `swapUsdcToAsset` | → `IZenoIndexVault.getAsset` / `usdcToken` / `router` / `executeSwap`; `ERC20Minimal.approve` |
 | `swapAssetToUsdc` | Same swap path as above for redeem unwind |
 | `setTargetAllocations` | → `Constants.MAX_ASSETS` / `BPS_DENOM` |
-| `executeRebalance` | → `_sumNav`; `IZenoIndexVault.getAsset` / `usdcToken` / `swapModule`; `IPriceOracleLike.quoteUsdc`; `ISwapExecutorLike.executeSwap`; `Constants.REBALANCE_DRIFT_BPS`; may `_retireSlot` |
+| `executeRebalance` | → `_sumNav`; `IZenoIndexVault.getAsset` / `usdcToken` / `valueUsdc` / `router` / `executeSwap`; `Constants.REBALANCE_DRIFT_BPS`; may `_retireSlot` |
 | `proposeWriteOff` / `proposeReactivate` | Manager proposes Path B |
-| `executeWriteOff` / `executeReactivate` | Called by `ZenoIndexVault`; → oracle / `ERC20Minimal` / `_retireSlot` |
+| `executeWriteOff` / `executeReactivate` | Called by `ZenoIndexVault`; → `IZenoIndexVault.valueUsdc` / `ERC20Minimal` / `_retireSlot` |
 
-Internal helpers of note: `_sumNav` → `NavCalculation.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `ERC20Minimal.transfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`.
+Internal helpers of note: `_sumNav` → `ZenoIndexVault.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `ERC20Minimal.transfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`.
 
 Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`; `IZenoIndexVault`, `IVault`, `ISwapRouter`; `ERC20Minimal`, `ShareToken`, `VaultMath`, `Constants`.
-
----
-
-### `src/NavCalculation.sol`
-
-**What it does:** Stateless NAV valuation singleton — sums free (non-reserved) vault balances in USDC 6-decimal units.
-
-| Function | Dependencies / calls |
-|---|---|
-| `sumNav(...)` | → `IZenoIndexVault.usdcToken` / `getAsset`; `ERC20Minimal.balanceOf`; USDC legs valued 1:1; non-USDC legs → `IPriceOracle.quoteUsdc` |
-
----
-
-### `src/SwapExecutor.sol`
-
-**What it does:** Singleton swap orchestrator. Holds the current `ISwapRouter` address; vaults call it to execute swaps without custodied tokens.
-
-| Function | Dependencies / calls |
-|---|---|
-| `constructor(zenoIndexVault_)` | Binds factory as sole admin of router updates |
-| `setRouter` | Only `ZenoIndexVault`; updates `router` |
-| `executeSwap` | → `ISwapRouter(router).swap` |
 
 ---
 
@@ -254,7 +226,7 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 | Function | Dependencies / calls |
 |---|---|
-| `superAdmin` / `treasury` / `usdcToken` / `isEmergency` / `pricingModule` / `swapModule` / `priceOracle` / `isOperator` / `getAsset` | Interface only — implemented by `ZenoIndexVault` |
+| `superAdmin` / `treasury` / `usdcToken` / `isEmergency` / `router` / `isOperator` / `getAsset` / `valueUsdc` / `sumNav` / `executeSwap` | Interface only — implemented by `ZenoIndexVault` |
 
 ---
 

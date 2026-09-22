@@ -4,8 +4,6 @@ pragma solidity ^0.8.13;
 import {Test} from "forge-std/Test.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
-import {NavCalculation} from "../src/NavCalculation.sol";
-import {SwapExecutor} from "../src/SwapExecutor.sol";
 import {AccessMaster} from "../src/AccessMaster.sol";
 import {Constants} from "../src/libraries/Constants.sol";
 import {ShareToken} from "../src/tokens/ShareToken.sol";
@@ -22,8 +20,6 @@ import {IHooks} from "v4-core/interfaces/IHooks.sol";
 contract ZenoIndexVaultTest is Test {
     ZenoIndexVault internal zenoIndexVault;
     Vault internal vaultImpl;
-    NavCalculation internal navCalculation;
-    SwapExecutor internal swapExecutor;
     AccessMaster internal accessMaster;
     MockERC20 internal usdc;
     MockERC20 internal tokenA;
@@ -57,20 +53,16 @@ contract ZenoIndexVaultTest is Test {
         router = new UniswapV4Adapter(address(poolManager), dexAdmin);
 
         vaultImpl = new Vault();
-        navCalculation = new NavCalculation();
         accessMaster = new AccessMaster(address(this), treasury);
         zenoIndexVault = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
-        swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
-        zenoIndexVault.setPricingModule(address(navCalculation));
-        zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(address(router));
 
         _initPoolAndSeed(address(usdc), address(tokenA));
         _initPoolAndSeed(address(usdc), address(tokenB));
 
-        navCalculation.setPriceWhole(address(tokenA), 1_000_000);
-        navCalculation.setPriceWhole(address(tokenB), 1_000_000);
+        zenoIndexVault.setPriceWhole(address(tokenA), 1_000_000);
+        zenoIndexVault.setPriceWhole(address(tokenB), 1_000_000);
 
         assetA = zenoIndexVault.createAsset(address(tokenA));
         assetB = zenoIndexVault.createAsset(address(tokenB));
@@ -466,12 +458,12 @@ contract ZenoIndexVaultTest is Test {
         vm.prank(manager);
         v.executeRebalance(1, sellPath, 0);
 
-        // The sell amount is sized off the NavCalculation-priced NAV snapshot, while the real pool
+        // The sell amount is sized off the ZenoIndexVault-priced NAV snapshot, while the real pool
         // fills at a slightly different price — so a single pass can leave sub-lot-size
         // dust rather than an exact zero balance. That dust's value is now far under
         // Constants.REBALANCE_DRIFT_BPS of NAV, so the drift band correctly treats a
         // second pass as a no-op and the slot never auto-retires — an accepted tradeoff
-        // of driving rebalance sizing off NavCalculation price against a live AMM fill.
+        // of driving rebalance sizing off ZenoIndexVault price against a live AMM fill.
         assertLt(tokenB.balanceOf(address(v)), 1000, "wind-down should sell nearly all B");
         assertEq(v.numAssets(), 2, "dust balance keeps the 0% slot from auto-retiring");
 
@@ -968,7 +960,7 @@ contract ZenoIndexVaultTest is Test {
     ///      different slot's redeem leg is still in flight — it should just skip and leave
     ///      the slot in place instead.
     ///
-    ///      Slot 1 (tokenB) is the vault's only funded asset here, so its NavCalculation-priced
+    ///      Slot 1 (tokenB) is the vault's only funded asset here, so its ZenoIndexVault-priced
     ///      value equals the entire NAV and currentBps rounds to exactly BPS_DENOM — the
     ///      sell-delta math (Vault.sol's executeRebalance) then sizes sellAmount == free
     ///      exactly, with no rounding dust, so it reliably clears the whole balance to 0
@@ -1030,7 +1022,7 @@ contract ZenoIndexVaultTest is Test {
 
 
 
-    /// @dev Valuation must work with prices set only on NavCalculation.
+    /// @dev Valuation must work with prices set on ZenoIndexVault.
     function test_Deposit_UsesNavCalculationPrices() public {
         Vault v = _createDirectVault(0, 50, 0);
         _genesis(v, 1_000_000_000);
@@ -1056,5 +1048,54 @@ contract ZenoIndexVaultTest is Test {
         v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
 
         assertEq(usdc.allowance(address(v), address(router)), 0, "USDC allowance to router must be zeroed after swap");
+    }
+
+    // ── NAV / valuation (formerly NavCalculation.sol) ────────────────────────────
+
+    function test_ValueUsdc_UsdcIsOneToOne_NonUsdcUsesPriceTable() public {
+        assertEq(zenoIndexVault.valueUsdc(address(usdc), 5_000_000), 5_000_000);
+        assertEq(zenoIndexVault.valueUsdc(address(tokenA), 1e6), 1_000_000);
+    }
+
+    function test_ValueUsdc_RevertsWhenPriceUnset() public {
+        MockERC20 unset = new MockERC20("Unset", "UNS", 6);
+        vm.expectRevert(ZenoIndexVault.NoPrice.selector);
+        zenoIndexVault.valueUsdc(address(unset), 1e6);
+    }
+
+    function test_SumNav_RevertsOnLengthMismatch() public {
+        uint64[] memory ids = new uint64[](2);
+        uint256[] memory reserved = new uint256[](1);
+        vm.expectRevert(bytes("LEN"));
+        zenoIndexVault.sumNav(address(this), ids, reserved, 0);
+    }
+
+    function test_SetPrice_RevertsForNonSuperAdmin() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.setPrice(address(tokenA), 1, 1);
+    }
+
+    function test_SetPriceWhole_RevertsForNonSuperAdmin() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.setPriceWhole(address(tokenA), 1_000_000);
+    }
+
+    // ── Swap execution (formerly SwapExecutor.sol) ───────────────────────────────
+
+    function test_SetSwapRouter_RevertsForNonSuperAdmin() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.setSwapRouter(address(router));
+    }
+
+    function test_ExecuteSwap_RevertsWhenNoRouterSet() public {
+        ZenoIndexVault freshFactory = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
+        address[] memory path = new address[](2);
+        path[0] = address(usdc);
+        path[1] = address(tokenA);
+        vm.expectRevert(ZenoIndexVault.NoRouter.selector);
+        freshFactory.executeSwap(path, 1e6, 0, address(this), address(this));
     }
 }

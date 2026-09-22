@@ -4,14 +4,13 @@ pragma solidity ^0.8.13;
 import {Script, console2} from "forge-std/Script.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
-import {NavCalculation} from "../src/NavCalculation.sol";
-import {SwapExecutor} from "../src/SwapExecutor.sol";
 import {AccessMaster} from "../src/AccessMaster.sol";
 
 /// @notice Production deploy for the clone-factory ZenoIndexVault.
-///         Deploys Vault impl + NavCalculation + AccessMaster + ZenoIndexVault + SwapExecutor,
-///         then wires an existing stablecoin (USDC or USDG) and swap router.
-///         Asset USD valuation lives entirely in NavCalculation (set prices after deploy).
+///         Deploys Vault impl + AccessMaster + ZenoIndexVault, then wires an existing
+///         stablecoin (USDC or USDG) and swap router. NAV/valuation and swap execution
+///         (formerly NavCalculation.sol / SwapExecutor.sol) now live inside
+///         ZenoIndexVault.sol itself — set asset prices on it after deploy.
 ///
 /// Required env:
 ///   PRIVATE_KEY   — deployer key (hex, with or without 0x)
@@ -54,14 +53,10 @@ contract Deploy is Script {
 
         Vault vaultImpl = new Vault();
         AccessMaster accessMaster = new AccessMaster(deployer, treasury);
-        NavCalculation navCalculation = new NavCalculation();
 
         ZenoIndexVault zenoIndexVault =
             new ZenoIndexVault(stablecoin, address(vaultImpl), address(accessMaster));
-        SwapExecutor swapExecutor = new SwapExecutor(address(zenoIndexVault));
 
-        zenoIndexVault.setPricingModule(address(navCalculation));
-        zenoIndexVault.setSwapModule(address(swapExecutor));
         zenoIndexVault.setSwapRouter(swapRouter);
 
         _registerOptionalAssets(zenoIndexVault);
@@ -71,8 +66,6 @@ contract Deploy is Script {
         console2.log("--- deployed ---");
         console2.log("ZenoIndexVault (factory):", address(zenoIndexVault));
         console2.log("Vault (impl):            ", address(vaultImpl));
-        console2.log("NavCalculation:          ", address(navCalculation));
-        console2.log("SwapExecutor:            ", address(swapExecutor));
         console2.log("AccessMaster:            ", address(accessMaster));
         console2.log("superAdmin:", zenoIndexVault.superAdmin());
         console2.log("treasury:  ", zenoIndexVault.treasury());

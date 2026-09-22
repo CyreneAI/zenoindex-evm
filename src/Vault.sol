@@ -11,31 +11,9 @@ import {ShareToken} from "./tokens/ShareToken.sol";
 import {VaultMath} from "./libraries/VaultMath.sol";
 import {Constants} from "./libraries/Constants.sol";
 
-interface ISwapExecutorLike {
-    function router() external view returns (address);
-    function executeSwap(address[] calldata path, uint256 amountIn, uint256 minAmountOut, address from, address to)
-        external
-        returns (uint256);
-}
-
-interface INavCalculationLike {
-    function sumNav(
-        address zenoIndexVaultAddr,
-        address vaultClone,
-        uint64[] calldata assetIds,
-        uint256[] calldata reservedAmounts,
-        uint256 excludeFromUsdcLeg
-    ) external view returns (uint256);
-
-    function valueUsdc(address zenoIndexVaultAddr, address token, uint256 amount)
-        external
-        view
-        returns (uint256);
-}
-
 /// @notice ERC-1167 clone implementation — one instance per ETF. Owns all per-vault storage.
-///         Reads NavCalculation/SwapExecutor addresses and role/asset-registry data live from `zenoIndexVault`
-///         on every call — never caches them.
+///         Reads NAV/valuation, swap execution, and role/asset-registry data live from
+///         `zenoIndexVault` on every call — never caches them.
 contract Vault is Initializable, ReentrancyGuard, IVault {
     // ── Enums ─────────────────────────────────────────────────────────────────
     enum FundType {
@@ -397,11 +375,10 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         require(path[0] == usdc, "PATH_START");
         if (path[path.length - 1] != mint) revert PathEnd();
 
-        address swapExecutorAddr = IZenoIndexVault(zenoIndexVault).swapModule();
-        address routerAddr = ISwapExecutorLike(swapExecutorAddr).router();
+        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
         ERC20Minimal(usdc).approve(routerAddr, amount);
         uint256 assetOut =
-            ISwapExecutorLike(swapExecutorAddr).executeSwap(path, amount, minAssetOut, address(this), address(this));
+            IZenoIndexVault(zenoIndexVault).executeSwap(path, amount, minAssetOut, address(this), address(this));
         ERC20Minimal(usdc).approve(routerAddr, 0);
 
         totalPendingUsdc = totalPendingUsdc > amount ? totalPendingUsdc - amount : 0;
@@ -425,11 +402,10 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 assetAmount = rs.assetAmountIn[assetIndex];
         if (assetAmount == 0) revert ZeroAmount();
 
-        address swapExecutorAddr = IZenoIndexVault(zenoIndexVault).swapModule();
-        address routerAddr = ISwapExecutorLike(swapExecutorAddr).router();
+        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
         ERC20Minimal(mint).approve(routerAddr, assetAmount);
-        uint256 usdcOut = ISwapExecutorLike(swapExecutorAddr)
-            .executeSwap(path, assetAmount, minUsdcOut, address(this), address(this));
+        uint256 usdcOut =
+            IZenoIndexVault(zenoIndexVault).executeSwap(path, assetAmount, minUsdcOut, address(this), address(this));
         ERC20Minimal(mint).approve(routerAddr, 0);
 
         redeemUsdcBal[msg.sender] += usdcOut;
@@ -483,7 +459,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
             // Reject an assetId that was never registered on ZenoIndexVault.sol (or was
             // deactivated) — accepting it here would store a slot whose getAsset(id) later
-            // resolves to mint == address(0), and every NAV read (_sumNav -> NavCalculation.sumNav
+            // resolves to mint == address(0), and every NAV read (_sumNav -> ZenoIndexVault.sumNav
             // -> ERC20Minimal(address(0)).balanceOf(...)) then reverts, permanently
             // bricking deposit/redeem/rebalance for the whole vault.
             (,, bool active, bool exists) = IZenoIndexVault(zenoIndexVault).getAsset(id);
@@ -532,8 +508,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 free = bal > _reservedAssets[assetIndex] ? bal - _reservedAssets[assetIndex] : 0;
 
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
-        uint256 currentValueUsdc = INavCalculationLike(navCalculationAddr).valueUsdc(zenoIndexVault, mint, free);
+        uint256 currentValueUsdc = IZenoIndexVault(zenoIndexVault).valueUsdc(mint, free);
 
         uint256 currentBps = (currentValueUsdc * Constants.BPS_DENOM) / nav;
         uint256 targetBps = _allocationBps[assetIndex];
@@ -541,8 +516,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 driftBps = currentBps > targetBps ? currentBps - targetBps : targetBps - currentBps;
         if (driftBps <= Constants.REBALANCE_DRIFT_BPS) return;
 
-        address swapExecutorAddr = IZenoIndexVault(zenoIndexVault).swapModule();
-        address routerAddr = ISwapExecutorLike(swapExecutorAddr).router();
+        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
 
         if (currentBps > targetBps) {
             // Overweight: sell the delta down to USDC — path must start at the asset and
@@ -553,7 +527,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             require(path[0] == mint, "PATH_START");
             if (path[path.length - 1] != usdc) revert PathEnd();
             ERC20Minimal(mint).approve(routerAddr, sellAmount);
-            ISwapExecutorLike(swapExecutorAddr).executeSwap(path, sellAmount, minOut, address(this), address(this));
+            IZenoIndexVault(zenoIndexVault).executeSwap(path, sellAmount, minOut, address(this), address(this));
             ERC20Minimal(mint).approve(routerAddr, 0);
             emit RebalanceExecuted(assetIndex, sellAmount, true);
         } else {
@@ -570,7 +544,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             require(path[0] == usdc, "PATH_START");
             if (path[path.length - 1] != mint) revert PathEnd();
             ERC20Minimal(usdc).approve(routerAddr, buyAmount);
-            ISwapExecutorLike(swapExecutorAddr).executeSwap(path, buyAmount, minOut, address(this), address(this));
+            IZenoIndexVault(zenoIndexVault).executeSwap(path, buyAmount, minOut, address(this), address(this));
             ERC20Minimal(usdc).approve(routerAddr, 0);
             emit RebalanceExecuted(assetIndex, buyAmount, false);
         }
@@ -614,8 +588,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
         uint256 navContribution;
         if (bal > 0) {
-            address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
-            navContribution = INavCalculationLike(navCalculationAddr).valueUsdc(zenoIndexVault, mint, bal);
+            navContribution = IZenoIndexVault(zenoIndexVault).valueUsdc(mint, bal);
         }
 
         isWrittenOff[assetId] = true;
@@ -773,9 +746,8 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             ids[i] = _assetIds[i];
             reserved[i] = _reservedAssets[i];
         }
-        address navCalculationAddr = IZenoIndexVault(zenoIndexVault).pricingModule();
-        return INavCalculationLike(navCalculationAddr)
-            .sumNav(zenoIndexVault, address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
+        return IZenoIndexVault(zenoIndexVault)
+            .sumNav(address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
     }
 
     function _slotOf(uint64 assetId) internal view returns (uint8) {
