@@ -24,4 +24,7 @@ interface IVault {
 
     /// @dev Same caller restriction as executeWriteOff.
     function executeReactivate(uint64 assetId) external;
+
+    /// @dev Same caller restriction as executeWriteOff. Moves a written-off asset's balance to `to`.
+    function executeSweep(uint64 assetId, address to) external;
 }

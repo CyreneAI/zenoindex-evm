@@ -2,8 +2,10 @@
 src = "src"
 out = "out"
 libs = ["lib"]
-# No fixed `solc` pin: project files (^0.8.13) build on the latest 0.8.x, while
-# lib/v4-core/src/PoolManager.sol pins exactly 0.8.26 and is auto-selected per file.
+# Pinned: every file (project ^0.8.13 and lib/v4-core's exact 0.8.26 PoolManager)
+# builds with one reproducible compiler. v4-core's transient storage needs cancun.
+solc_version = "0.8.26"
+evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
 via_ir = true

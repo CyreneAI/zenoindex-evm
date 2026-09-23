@@ -1,148 +1,112 @@
-# Open issues — fix before mainnet
+# Pre-mainnet review — resolution
 
-**Date:** 2026-09-23
-**Verdict:** Do not deploy until these are closed.
+**Review date:** 2026-09-23
+**Status:** All 13 issues and the "Also fix" list are addressed in code and covered by regression tests (`forge test`: 100 passing). One item (fee-on-transfer / rebasing) is only partly solvable on-chain; see below. One new issue found while fixing is still **open**; see [Still open](#still-open).
 
----
-
-## 1. `createVault` is permissionless
-
-`src/ZenoIndexVault.sol` — `createVault`
-
-Anyone can clone a vault, become its manager, and land it in `vaultClones`. A UI that enumerates the factory will list attacker vaults next to real ones.
-
-**Fix:** Gate creation to super-admin (or a dedicated authority), or add an `official` flag only super-admin can set.
+Legend: **Bug** = the code broke its own invariants. **Design** = the code worked as written; the policy or trust model changed.
 
 ---
 
-## 2. NAV is an unbounded admin price table
+## 1. `createVault` is permissionless: fixed (Design)
 
-`src/ZenoIndexVault.sol` — `setPrice` / `setPriceWhole`
+`createVault` now requires super-admin or an account allowlisted with `ZenoIndexVault.setVaultCreator`. Every entry in `vaultClones` is official, and clones are tracked in `isVaultClone`.
+Tests: `test_CreateVault_RevertsForNonAllowlistedCaller`
 
-Super-admin sets every non-USDC price. `usdcOut == 0` is allowed. There is no heartbeat, max-age, or range check. A leaked or mistaken admin key can deflate NAV, mint cheap shares, then restore the price. Stale prices silently mis-value the basket.
+## 2. NAV is an unbounded admin price table: fixed (Design)
 
-**Fix:** Reject `usdcOut == 0`. Add freshness/bounds, or a TWAP/push oracle with a heartbeat.
+- A zero price is rejected (`ZeroPrice`).
+- Freshness: every quote reverts `StalePrice` once a price is older than `maxPriceAge` (default 1 day, 0 disables).
+- Bounds: one update can't move a price by more than `maxPriceChangeBps` (default 20%, 0 disables).
 
----
+This is still an admin-pushed table, not a TWAP. A keeper must refresh prices daily or deposits and rebalances halt.
+Tests: `test_SetPrice_RejectsZeroAndOversizedMove`, `test_StalePrice_BlocksDepositUntilRefreshed`
 
-## 3. Zero-output redeem freezes write-off and slot retire
+## 3. Zero-output redeem freezes write-off and slot retire: fixed (Bug)
 
-`src/Vault.sol` — `requestRedeem` / `claim`
+`requestRedeem` reverts `ZeroAmount` when the USDC credit and every swap leg round to 0. `claim` no longer reverts on a zero escrow; it just closes the redeem.
+Tests: `test_RequestRedeem_RevertsWhenEverythingRoundsToZero`
 
-`requestRedeem` always increments `activeRedeemCount`. If every pro-rata amount and the pending-USDC carve round to 0, `claim` reverts `NothingToClaim` and never calls `_resetRedeem`. The user is stuck (`RedeemAlreadyPending`). `activeRedeemCount` stays `> 0`, so write-off and auto-retire are blocked for the whole vault.
+## 4. Super-admin transfer is one-step and can split-brain: fixed (Bug for the split, Design for two-step)
 
-**Fix:** Revert `ZeroAmount` when the carve and all swap amounts are zero, or add a cancel/`claim` path that clears a zero-output redeem.
+- Two-step transfer: `setSuperAdmin` proposes `pendingSuperAdmin`, then `acceptSuperAdmin` completes it. A wrong address is fixed by proposing again.
+- `grantRole` / `revokeRole` / `renounceRole` revert for `ADMIN_ROLE`, so the role holder and `superAdmin()` stay in lockstep.
 
----
+Tests: `AccessMaster.t.sol`: `test_SetSuperAdmin_OnlyProposesUntilAccepted`, `test_AcceptSuperAdmin_*`, `test_SetSuperAdmin_TypoIsRecoverableByReproposing`, `test_AdminRole_CannotBeGrantedRevokedOrRenouncedDirectly`
 
-## 4. Super-admin transfer is one-step and can split-brain
+## 5. Global operator has custody of every vault: fixed (Design)
 
-`src/AccessMaster.sol` — `setSuperAdmin`, inherited `grantRole` / `revokeRole` / `renounceRole`
+- Vault manager powers come from `vaultManager` or an operator scoped to **that vault** (`ZenoIndexVault.setVaultOperator(vaultId, account, allowed)`). A global `AccessMaster` operator now only manages the asset registry.
+- Price-table swap floor: `executeSwap` raises every `minAmountOut` to `swapFloor`, which is the price-table quote less `maxSwapSlippageBps` (default 3%). `minOut = 0` no longer means "any price".
 
-A typo in `setSuperAdmin` is irreversible (no pending/accept). `grantRole(ADMIN_ROLE, B)` adds a second admin without updating `_superAdmin`. `ZenoIndexVault.onlySuperAdmin` keys off `_superAdmin()`; treasury/operators key off `ADMIN_ROLE`. `setSuperAdmin` only revokes `msg.sender`, so a leftover role holder survives a transfer started by the other.
+Tests: `test_Operators_AreScopedPerVault`, `test_Swap_PriceTableFloorOverridesZeroMinOut`
 
-**Fix:** Two-step transfer. Route `ADMIN_ROLE` only through `setSuperAdmin`. Keep `_superAdmin` and the role in lockstep.
+## 6. `setUsdcToken` after live vaults desyncs accounting: fixed (Design)
 
----
+`setUsdcToken` reverts `VaultsExist` once `totalVaults > 0`.
+Tests: `test_SetUsdcToken_RevertsOnceAVaultExists`
 
-## 5. Global operator has custody of every vault and the asset registry
+## 7. Emergency / pause do not halt swaps, rebalance, or `setPrice`: fixed (Design)
 
-`src/Vault.sol` — `onlyManager`  
-`src/ZenoIndexVault.sol` — `onlySuperAdminOrOperator`
-
-`isOperator` is protocol-wide. One leaked operator key can retarget, rebalance (`minOut = 0`, intermediate hops caller-supplied), pause, change fee recipients on every vault, and `createAsset` / `setAssetActive`.
-
-**Fix:** Scope operators per vault. Enforce an oracle-based min-out floor on swap paths.
-
----
-
-## 6. `setUsdcToken` after live vaults desyncs accounting
-
-`src/ZenoIndexVault.sol` — `setUsdcToken`
-
-Clones read `usdcToken` live. Changing it after deposits leaves old balances in the old mint while NAV/fees/swaps treat the new mint as the 1:1 peg.
-
-**Fix:** Make `usdcToken` immutable, or revert if `totalVaults > 0`.
-
----
-
-## 7. Emergency / pause do not halt swaps, rebalance, or `setPrice`
-
-| Flag | Blocks | Still runs |
+| Flag | Now blocks | Still open |
 |---|---|---|
-| `isEmergency` | `createVault` | deposits, redeems, swaps, rebalance, genesis, `setPrice` |
-| `paused` / `adminLocked` | `deposit` | genesis, redeem, swaps, rebalance |
+| `isEmergency` | `createVault`, genesis, deposits, **every swap** (enforced in `executeSwap`), rebalance | `requestRedeem`, `claim`, `claimInKind`, `setPrice` |
+| `paused` / `adminLocked` | genesis, deposits, `swapUsdcToAsset`, `executeRebalance` | user exits (`swapAssetToUsdc` is blocked by `adminLocked` only) |
 
-A bad price or router cannot be frozen without relying on the manager to stop calling.
+**Deliberate change from the review:** `setPrice` stays callable during an emergency, so a bad price can be corrected while every value-moving path is frozen. Blocking it would force an unfreeze before the fix.
+Tests: `test_Emergency_HaltsDepositsAndSwapsButNotInKindExit`, `test_Pause_HaltsManagerSwapsAndRebalance`
 
-**Fix:** Emergency/pause must halt swaps, rebalance, genesis, and `setPrice`.
+## 8. Redeem cannot be cancelled: fixed (Design)
 
----
+- `claimInKind()`: the redeemer closes the redeem at any time (even during pause or emergency). Unswapped legs are paid in the asset itself, with the redeem fee taken in-kind, plus any escrowed USDC.
+- `forceSettleRedeem(user)`: after `Constants.REDEEM_TIMEOUT` (7 days) anyone can settle an abandoned redeem in-kind. Proceeds go to the redeemer. An abandoned or griefing redeem can therefore no longer block write-off or slot retire forever.
 
-## 8. Redeem cannot be cancelled
+Tests: `test_ClaimInKind_SettlesUnswappedLegsInAsset`, `test_ForceSettleRedeem_OnlyAfterTimeout`
 
-`src/Vault.sol` — `requestRedeem`
+## 9. `previewDeposit` disagrees with the share-cap clamp: fixed (Bug)
 
-Shares burn first. A failed hop (or issue 3) leaves burned shares and reserved assets. No timeout.
+`deposit` and `previewDeposit` share `_quoteDeposit`, including the clamp. On the clamp path the fee is recomputed from the clamped gross, and pending is earmarked from `fee.netAmount` (the net cash actually kept).
+Tests: `test_PreviewDeposit_MatchesClampedDeposit`
 
-**Fix:** Cancel or timeout that restores or settles the position.
+## 10. Wind-down dust never retires the slot: fixed (Bug)
 
----
+A 0%-target slot now sells its **whole** free balance (not a price-sized delta). It retires in the same call once what's left is worth at most `Constants.RETIRE_DUST_USDC` ($0.001), so donated dust can't pin a slot open.
+Tests: `test_ExecuteRebalance_WindDownSellsDownToSubDriftBandDust`, `test_ExecuteRebalance_DonatedDustDoesNotBlockRetire`
 
-## 9. `previewDeposit` disagrees with the share-cap clamp
+## 11. Written-off tokens have no sweep: fixed (Design)
 
-`src/Vault.sol` — `previewDeposit` / `deposit`
+`ZenoIndexVault.sweepWrittenOff(vaultId, assetId, to)` (super-admin) moves a written-off asset's balance out through `Vault.executeSweep`. USDC can't be written off (that would strand pending and escrowed cash). The write-off's NAV snapshot is best-effort, so a dead token's stale price can't block it.
+Tests: `test_WriteOff_LeavesTokensInCustodyUntilSwept`, `test_SweepWrittenOff_RevertsForLiveAssetAndNonSuperAdmin`
 
-Preview ignores `maxShares`. On the clamp path, `_recordPendingTargets(clampedNet)` can over-earmark vs `computeFeeSplit(clampedGross).netAmount`.
+## 12. V4 adapter allows arbitrary hooks: fixed (Design)
 
-**Fix:** Apply the same clamp in preview. Record pending from the actual net cash kept.
+`setPool` requires `hooks == address(0)` or a hook allowlisted with `setHookAllowed`.
+Tests: `test_setPool_rejectsHookUntilAllowlisted`
 
----
+## 13. `executeSwap` is public: fixed (Bug)
 
-## 10. Wind-down dust never retires the slot
+- `ZenoIndexVault.executeSwap`: registered clones only, and `from == msg.sender`.
+- The actual hole was **`UniswapV4Adapter.swap`**: it was public and pulled from any `from`. It now requires an admin-authorized caller (`setAuthorizedCaller`). Authorize the factory after deploy.
 
-`src/Vault.sol` — `executeRebalance`
-
-Oracle-sized sell vs AMM fill leaves sub-drift-band dust. A second pass no-ops. Repeated rotations can fill all 20 slots → `SlotFull`.
-
-**Fix:** Dust sweep or a retire path that does not require an exact zero balance.
-
----
-
-## 11. Written-off tokens have no sweep
-
-`src/Vault.sol` — `executeWriteOff`
-
-Tokens stay in the vault. Recovery is reactivate + rebalance, which puts them back in NAV.
-
-**Fix:** Super-admin sweep, or document as permanent lock.
-
----
-
-## 12. V4 adapter allows arbitrary hooks
-
-`src/adapters/UniswapV4Adapter.sol` — `setPool`
-
-Any hook address is accepted. A hook can skew fills during vault swaps.
-
-**Fix:** Allowlist hooks, or require `hooks == address(0)` unless explicitly set.
-
----
-
-## 13. `executeSwap` is public
-
-`src/ZenoIndexVault.sol` — `executeSwap`
-
-Anyone can drive the router with arbitrary `from` / `to`. A leftover vault→router allowance plus a lazy-pulling router is a pull risk.
-
-**Fix:** Restrict callers to registered vault clones.
+Tests: `test_ExecuteSwap_RevertsForNonClone`, `test_swap_revertsForUnauthorizedCaller_evenWithVictimAllowance`
 
 ---
 
 ## Also fix
 
-- **SafeERC20** — `require(token.transferFrom(...))` breaks on tokens that return no data.
-- **`setFeeRecipient(address(0))`** — allowed; fees can be burned or the transfer reverts.
-- **Fee-on-transfer / rebasing** — `createAsset` does not reject them; accounting assumes 1:1 receipt.
-- **Deploy** — `Deploy.s.sol` leaves `router == address(0)` and an empty price table. Set router and prices before any vault is created, or put them in the script.
-- **Pin `solc`** in `foundry.toml`.
+- **SafeERC20: fixed (Bug).** `Vault` and `UniswapV4Adapter` use `safeTransfer` / `safeTransferFrom` / `forceApprove`.
+- **`setFeeRecipient(address(0))`: fixed (Bug).** Reverts `ZeroAddress`. Test: `test_SetFeeRecipient_RevertsOnZero`.
+- **Fee-on-transfer / rebasing: partly fixed (Design).** Swap outputs are measured by balance delta, and a fee-on-transfer input makes the adapter's payment revert, so these tokens fail loudly instead of mis-accounting. Contracts can't reliably detect such tokens (fees can be switched on later), so `createAsset` documents them as unsupported. **Asset listing must screen for them off-chain.**
+- **Deploy: fixed.** `createVault` reverts until the router is set and every non-USDC basket asset has a price (tests: `test_CreateVault_RevertsWhenNoRouterSet`, `test_CreateVault_RevertsWhenAssetHasNoPrice`). `Deploy.s.sol` can price assets at deploy (`ASSET_i_PRICE`) and lists the post-deploy steps.
+- **Pin `solc`: fixed.** `foundry.toml` pins `solc_version = "0.8.26"`, `evm_version = "cancun"`.
+
+## New issue found while fixing
+
+- **USDC as a basket slot double-counted in redeems: fixed (Bug).** `requestRedeem` counted pending and escrowed USDC as the USDC slot's free balance, then paid the pending share again through the carve. It now excludes both, and credits the USDC slot's share straight to escrow (no swap leg).
+  Test: `test_RequestRedeem_UsdcSlotExcludesPendingAndEscrow`
+
+---
+
+## Still open
+
+1. **Spare USDC is not in NAV unless the vault has a USDC slot.** `totalNav = sumNav(slots) + totalPendingUsdc`. USDC from rebalance sales, or pending dropped when a slot retires or is written off, sits in the vault but is counted nowhere. Between an overweight sale and the matching buy, NAV is understated, so a deposit in that window mints cheap shares. **Fix:** count the vault's USDC balance minus `totalPendingUsdc + vaultRedeemEscrowTotal` in NAV even without a USDC slot.
+2. **`script/check-readme-src-docs.sh` fails** on `NavCalculation.sol` / `SwapExecutor.sol` sections. It was already failing before these fixes because those contracts were merged into `ZenoIndexVault.sol`; the script needs updating.

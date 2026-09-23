@@ -10,8 +10,15 @@ import {AccessMaster} from "../src/AccessMaster.sol";
 ///         Deploys Vault impl + AccessMaster + ZenoIndexVault, then wires an existing
 ///         stablecoin (USDC or USDG). NAV/valuation and swap execution (formerly
 ///         NavCalculation.sol / SwapExecutor.sol) now live inside ZenoIndexVault.sol
-///         itself — set asset prices and the swap router (`setSwapRouter`) on it in a
-///         follow-up transaction after deploy; `executeSwap` reverts (NoRouter) until then.
+///         itself. `createVault` reverts until the router is set and every basket asset
+///         has a price, so no vault can go live half-configured.
+///
+/// Post-deploy (super-admin), before the first vault:
+///   1. UniswapV4Adapter.setAuthorizedCaller(zenoIndexVault, true)   — adapter admin
+///   2. zenoIndexVault.setSwapRouter(adapter)
+///   3. zenoIndexVault.setPriceWhole(asset, usdcPerWholeToken) for any asset not priced here
+///   4. zenoIndexVault.setVaultCreator(manager, true) for each account allowed to create vaults
+///   Prices go stale after `maxPriceAge` (default 1 day) — keep a keeper refreshing them.
 ///
 /// Required env:
 ///   PRIVATE_KEY   — deployer key (hex, with or without 0x)
@@ -20,6 +27,7 @@ import {AccessMaster} from "../src/AccessMaster.sol";
 /// Optional env:
 ///   TREASURY      — fee treasury (defaults to deployer)
 ///   ASSET_0..ASSET_4 — optional ERC-20 mints to register via createAsset
+///   ASSET_0_PRICE..ASSET_4_PRICE — optional USDC (6-dec) per whole token, set via setPriceWhole
 ///
 /// Robinhood Chain Testnet (chainId 46630):
 ///   1. Fund deployer with test ETH: https://faucet.testnet.chain.robinhood.com
@@ -67,7 +75,8 @@ contract Deploy is Script {
         console2.log("usdcToken: ", zenoIndexVault.usdcToken());
     }
 
-    /// @dev Registers ASSET_0 .. ASSET_4 when set (address(0) / unset is skipped).
+    /// @dev Registers ASSET_0 .. ASSET_4 when set (address(0) / unset is skipped), pricing
+    ///      each one first when ASSET_i_PRICE is set.
     function _registerOptionalAssets(ZenoIndexVault zenoIndexVault) internal {
         address[5] memory mints = [
             vm.envOr("ASSET_0", address(0)),
@@ -76,9 +85,17 @@ contract Deploy is Script {
             vm.envOr("ASSET_3", address(0)),
             vm.envOr("ASSET_4", address(0))
         ];
+        uint256[5] memory prices = [
+            vm.envOr("ASSET_0_PRICE", uint256(0)),
+            vm.envOr("ASSET_1_PRICE", uint256(0)),
+            vm.envOr("ASSET_2_PRICE", uint256(0)),
+            vm.envOr("ASSET_3_PRICE", uint256(0)),
+            vm.envOr("ASSET_4_PRICE", uint256(0))
+        ];
 
         for (uint256 i = 0; i < mints.length; i++) {
             if (mints[i] == address(0)) continue;
+            if (prices[i] != 0) zenoIndexVault.setPriceWhole(mints[i], prices[i]);
             uint64 assetId = zenoIndexVault.createAsset(mints[i]);
             console2.log("Registered assetId:", assetId);
             console2.log("  mint:", mints[i]);

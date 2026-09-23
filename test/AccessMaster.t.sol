@@ -36,25 +36,79 @@ contract AccessMasterTest is Test {
         new AccessMaster(admin, address(0));
     }
 
-    // ── Admin transfer — one call by the current super-admin, no pending step ──
+    // ── Admin transfer — two-step: propose, then the new admin accepts ──
 
-    function test_SetSuperAdmin_TransfersInOneCall() public {
-        vm.expectEmit(true, true, false, false);
-        emit AccessMaster.SuperAdminTransferred(admin, newAdmin);
-        accessMaster.setSuperAdmin(newAdmin);
-
-        assertEq(accessMaster.superAdmin(), newAdmin);
-        assertTrue(accessMaster.hasRole(accessMaster.ADMIN_ROLE(), newAdmin));
-        assertFalse(accessMaster.hasRole(accessMaster.ADMIN_ROLE(), admin), "old admin should lose the role");
+    function _transferAdmin(address to) internal {
+        accessMaster.setSuperAdmin(to);
+        vm.prank(to);
+        accessMaster.acceptSuperAdmin();
     }
 
-    function test_SetSuperAdmin_NewAdminCanImmediatelyActNoAcceptanceStep() public {
+    function test_SetSuperAdmin_OnlyProposesUntilAccepted() public {
+        vm.expectEmit(true, true, false, false);
+        emit AccessMaster.SuperAdminTransferStarted(admin, newAdmin);
         accessMaster.setSuperAdmin(newAdmin);
 
-        // No separate "accept" call needed — newAdmin can act as super-admin right away.
+        assertEq(accessMaster.pendingSuperAdmin(), newAdmin);
+        assertEq(accessMaster.superAdmin(), admin, "nothing moves before accept");
+        assertTrue(accessMaster.hasRole(accessMaster.ADMIN_ROLE(), admin));
+        assertFalse(accessMaster.hasRole(accessMaster.ADMIN_ROLE(), newAdmin));
+    }
+
+    function test_AcceptSuperAdmin_TransfersRoleAndSuperAdmin() public {
+        accessMaster.setSuperAdmin(newAdmin);
+
+        vm.expectEmit(true, true, false, false);
+        emit AccessMaster.SuperAdminTransferred(admin, newAdmin);
+        vm.prank(newAdmin);
+        accessMaster.acceptSuperAdmin();
+
+        assertEq(accessMaster.superAdmin(), newAdmin);
+        assertEq(accessMaster.pendingSuperAdmin(), address(0));
+        assertTrue(accessMaster.hasRole(accessMaster.ADMIN_ROLE(), newAdmin));
+        assertFalse(accessMaster.hasRole(accessMaster.ADMIN_ROLE(), admin), "old admin should lose the role");
+
         vm.prank(newAdmin);
         accessMaster.setTreasury(treasury1);
         assertEq(accessMaster.treasury(), treasury1);
+    }
+
+    function test_AcceptSuperAdmin_RevertsForNonPending() public {
+        accessMaster.setSuperAdmin(newAdmin);
+        vm.prank(stranger);
+        vm.expectRevert(AccessMaster.NotPendingSuperAdmin.selector);
+        accessMaster.acceptSuperAdmin();
+    }
+
+    function test_SetSuperAdmin_TypoIsRecoverableByReproposing() public {
+        accessMaster.setSuperAdmin(stranger); // wrong address
+        accessMaster.setSuperAdmin(newAdmin); // overwrite before anyone accepts
+
+        vm.prank(stranger);
+        vm.expectRevert(AccessMaster.NotPendingSuperAdmin.selector);
+        accessMaster.acceptSuperAdmin();
+
+        vm.prank(newAdmin);
+        accessMaster.acceptSuperAdmin();
+        assertEq(accessMaster.superAdmin(), newAdmin);
+    }
+
+    /// @dev Review #4: ADMIN_ROLE can't be moved outside setSuperAdmin/accept, so the role
+    ///      holder and `superAdmin()` never split.
+    function test_AdminRole_CannotBeGrantedRevokedOrRenouncedDirectly() public {
+        bytes32 adminRole = accessMaster.ADMIN_ROLE();
+
+        vm.expectRevert(AccessMaster.AdminRoleManagedBySetSuperAdmin.selector);
+        accessMaster.grantRole(adminRole, newAdmin);
+
+        vm.expectRevert(AccessMaster.AdminRoleManagedBySetSuperAdmin.selector);
+        accessMaster.revokeRole(adminRole, admin);
+
+        vm.expectRevert(AccessMaster.AdminRoleManagedBySetSuperAdmin.selector);
+        accessMaster.renounceRole(adminRole, admin);
+
+        assertEq(accessMaster.superAdmin(), admin);
+        assertTrue(accessMaster.hasRole(adminRole, admin));
     }
 
     function test_SetSuperAdmin_RevertsForNonAdmin() public {
@@ -71,7 +125,7 @@ contract AccessMasterTest is Test {
     }
 
     function test_SetSuperAdmin_OldAdminCanNoLongerActAfterTransfer() public {
-        accessMaster.setSuperAdmin(newAdmin);
+        _transferAdmin(newAdmin);
 
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, admin, bytes32(0))
@@ -150,7 +204,7 @@ contract AccessMasterTest is Test {
     function test_SuperAdminTransfer_NewAdminCanThenGrantOperatorRole() public {
         bytes32 operatorRole = accessMaster.OPERATOR_ROLE();
 
-        accessMaster.setSuperAdmin(newAdmin);
+        _transferAdmin(newAdmin);
 
         vm.prank(newAdmin);
         accessMaster.grantRole(operatorRole, operator);

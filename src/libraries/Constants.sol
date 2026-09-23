@@ -32,4 +32,12 @@ library Constants {
     /// @dev Path A rebalance drift-band: an asset within 0.5% (absolute) of its target
     ///      weight is skipped by executeRebalance, so ordinary price drift doesn't churn.
     uint16 internal constant REBALANCE_DRIFT_BPS = 50;
+
+    /// @dev A 0%-target slot retires once its free balance is worth at most this (USDC 6-dec,
+    ///      $0.001). Anything left behind stays in the vault untracked; the bar is kept tiny
+    ///      so real value is always sold first, while donated dust can't pin the slot open.
+    uint256 internal constant RETIRE_DUST_USDC = 1_000;
+
+    /// @dev After this long, anyone may settle an open redeem in-kind (Vault.forceSettleRedeem).
+    uint256 internal constant REDEEM_TIMEOUT = 7 days;
 }

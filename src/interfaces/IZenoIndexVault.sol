@@ -13,6 +13,7 @@ interface IZenoIndexVault {
     function isEmergency() external view returns (bool);
     function router() external view returns (address);
     function isOperator(address account) external view returns (bool);
+    function isVaultOperator(address vault, address account) external view returns (bool);
 
     /// @return assetId_ The asset's id
     /// @return mint The asset's ERC-20 address

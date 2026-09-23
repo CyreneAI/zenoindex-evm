@@ -54,6 +54,9 @@ contract UniswapV4AdapterTest is Test {
         _initPoolAndSeed(address(tokenB), address(tokenC));
 
         tokenA.mint(vaultStandIn, 1_000e18);
+
+        vm.prank(admin);
+        adapter.setAuthorizedCaller(vaultStandIn, true);
     }
 
     function _initPoolAndSeed(address x, address y) internal {
@@ -152,5 +155,33 @@ contract UniswapV4AdapterTest is Test {
     function test_setPool_onlyAdmin() public {
         vm.expectRevert(UniswapV4Adapter.OnlyAdmin.selector);
         adapter.setPool(currency0Addr, currency1Addr, FEE, TICK_SPACING, address(0));
+    }
+
+    /// @dev Review #13: swap pulls from an arbitrary `from`, so an unauthorized caller must
+    ///      not be able to spend someone else's allowance to the adapter.
+    function test_swap_revertsForUnauthorizedCaller_evenWithVictimAllowance() public {
+        address[] memory path = new address[](2);
+        path[0] = currency0Addr;
+        path[1] = currency1Addr;
+
+        vm.prank(vaultStandIn);
+        tokenA.approve(address(adapter), type(uint256).max);
+
+        address attacker = address(0xBAD);
+        vm.prank(attacker);
+        vm.expectRevert(UniswapV4Adapter.NotAuthorizedCaller.selector);
+        adapter.swap(path, 10e18, 0, vaultStandIn, attacker);
+    }
+
+    /// @dev Review #12: a pool with a non-allowlisted hook cannot be registered.
+    function test_setPool_rejectsHookUntilAllowlisted() public {
+        address hook = address(0x4444);
+        vm.startPrank(admin);
+        vm.expectRevert(UniswapV4Adapter.HookNotAllowed.selector);
+        adapter.setPool(currency0Addr, address(tokenC), FEE, TICK_SPACING, hook);
+
+        adapter.setHookAllowed(hook, true);
+        adapter.setPool(currency0Addr, address(tokenC), FEE, TICK_SPACING, hook);
+        vm.stopPrank();
     }
 }

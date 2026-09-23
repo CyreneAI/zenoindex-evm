@@ -57,6 +57,9 @@ contract ZenoIndexVaultTest is Test {
         zenoIndexVault = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
 
         zenoIndexVault.setSwapRouter(address(router));
+        vm.prank(dexAdmin);
+        router.setAuthorizedCaller(address(zenoIndexVault), true);
+        zenoIndexVault.setVaultCreator(manager, true);
 
         _initPoolAndSeed(address(usdc), address(tokenA));
         _initPoolAndSeed(address(usdc), address(tokenB));
@@ -161,6 +164,8 @@ contract ZenoIndexVaultTest is Test {
         newRouter.setPool(address(usdc), address(tokenA), POOL_FEE, POOL_TICK_SPACING, address(0));
 
         zenoIndexVault.setSwapRouter(address(newRouter));
+        vm.prank(dexAdmin);
+        newRouter.setAuthorizedCaller(address(zenoIndexVault), true);
 
         address[] memory path = new address[](2);
         path[0] = address(usdc);
@@ -458,20 +463,38 @@ contract ZenoIndexVaultTest is Test {
         vm.prank(manager);
         v.executeRebalance(1, sellPath, 0);
 
-        // The sell amount is sized off the ZenoIndexVault-priced NAV snapshot, while the real pool
-        // fills at a slightly different price — so a single pass can leave sub-lot-size
-        // dust rather than an exact zero balance. That dust's value is now far under
-        // Constants.REBALANCE_DRIFT_BPS of NAV, so the drift band correctly treats a
-        // second pass as a no-op and the slot never auto-retires — an accepted tradeoff
-        // of driving rebalance sizing off ZenoIndexVault price against a live AMM fill.
-        assertLt(tokenB.balanceOf(address(v)), 1000, "wind-down should sell nearly all B");
-        assertEq(v.numAssets(), 2, "dust balance keeps the 0% slot from auto-retiring");
+        // Review #10: a 0% slot sells its WHOLE free balance (not an oracle-sized delta)
+        // and retires in the same call once at most RETIRE_DUST_USDC is left.
+        assertEq(tokenB.balanceOf(address(v)), 0, "wind-down sells the whole balance");
+        assertEq(v.numAssets(), 1, "0% slot retires in one pass");
+    }
 
+    /// @dev Review #10: donated dust (<= RETIRE_DUST_USDC) must not pin a 0% slot open —
+    ///      it is below the sell threshold, so the slot just retires around it.
+    function test_ExecuteRebalance_DonatedDustDoesNotBlockRetire() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        vm.prank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0); // B stays undeployed
+
+        uint64[] memory ids = new uint64[](1);
+        ids[0] = assetA;
+        uint16[] memory bps = new uint16[](1);
+        bps[0] = 10_000;
+        vm.prank(manager);
+        v.setTargetAllocations(ids, bps);
+
+        tokenB.mint(address(v), Constants.RETIRE_DUST_USDC); // attacker donates $0.001 of B
+
+        address[] memory sellPath = new address[](2);
+        sellPath[0] = address(tokenB);
+        sellPath[1] = address(usdc);
         vm.prank(manager);
         v.executeRebalance(1, sellPath, 0);
 
-        assertLt(tokenB.balanceOf(address(v)), 1000, "sub-drift-band dust is left in place");
-        assertEq(v.numAssets(), 2, "drift band correctly no-ops on dust below threshold");
+        assertEq(v.numAssets(), 1, "dust-only 0% slot retires");
+        assertEq(v.totalPendingUsdc(), 0, "retired slot's undeployed pending is dropped");
+        assertEq(tokenB.balanceOf(address(v)), Constants.RETIRE_DUST_USDC, "dust is left untracked, not sold");
     }
 
     // ── Path B write-off ──────────────────────────────────────────────────────
@@ -563,18 +586,40 @@ contract ZenoIndexVaultTest is Test {
         assertEq(v.allocationBpsAt(1), 0); // reactivated at 0% — manager re-weights separately
     }
 
-    function test_NoSweepFunction_WrittenOffTokensStayInCustody() public {
+    function test_WriteOff_LeavesTokensInCustodyUntilSwept() public {
         Vault v = _createDirectVault(0, 50, 0);
         _genesis(v, 1_000_000_000);
+        _deployBoth(v);
 
         uint256 balBefore = tokenA.balanceOf(address(v));
+        assertGt(balBefore, 0);
 
         vm.prank(manager);
         v.proposeWriteOff(assetA);
         zenoIndexVault.confirmWriteOff(0, assetA);
 
-        // Balance is untouched by write-off — tokens remain in the vault's custody.
+        // Write-off alone doesn't move tokens.
         assertEq(tokenA.balanceOf(address(v)), balBefore);
+
+        // Review #11: super-admin can sweep them out.
+        address recovery = address(0x5EE9);
+        zenoIndexVault.sweepWrittenOff(0, assetA, recovery);
+        assertEq(tokenA.balanceOf(address(v)), 0);
+        assertEq(tokenA.balanceOf(recovery), balBefore);
+        assertEq(v.writtenOffBalance(assetA), 0);
+    }
+
+    function test_SweepWrittenOff_RevertsForLiveAssetAndNonSuperAdmin() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        vm.expectRevert(Vault.NotWrittenOff.selector);
+        zenoIndexVault.sweepWrittenOff(0, assetA, address(0x5EE9));
+
+        vm.prank(manager);
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.sweepWrittenOff(0, assetA, manager);
+        v;
     }
 
     // ── PRE_MAINNET_REVIEW.md regression tests ──────────────────────────────────
@@ -1090,12 +1135,346 @@ contract ZenoIndexVaultTest is Test {
         zenoIndexVault.setSwapRouter(address(router));
     }
 
-    function test_ExecuteSwap_RevertsWhenNoRouterSet() public {
+    function test_CreateVault_RevertsWhenNoRouterSet() public {
         ZenoIndexVault freshFactory = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
-        address[] memory path = new address[](2);
-        path[0] = address(usdc);
-        path[1] = address(tokenA);
+        freshFactory.setPriceWhole(address(tokenA), 1_000_000);
+        uint64 id = freshFactory.createAsset(address(tokenA));
         vm.expectRevert(ZenoIndexVault.NoRouter.selector);
-        freshFactory.executeSwap(path, 1e6, 0, address(this), address(this));
+        freshFactory.createVault(_singleAssetParams(id));
+    }
+
+    function _singleAssetParams(uint64 id) internal pure returns (ZenoIndexVault.CreateVaultParams memory p) {
+        uint64[] memory ids = new uint64[](1);
+        ids[0] = id;
+        uint16[] memory bps = new uint16[](1);
+        bps[0] = 10_000;
+        p = ZenoIndexVault.CreateVaultParams({
+            feeRecipient: address(0),
+            depositFeeBps: 0,
+            redeemFeeBps: 50,
+            assetIds: ids,
+            allocationBps: bps,
+            fundType: 1,
+            maxShares: 0,
+            name: "Solo",
+            symbol: "SOLO"
+        });
+    }
+
+    // ── PRE_MAINNET_REVIEW.md (2026-09-23) regression tests ─────────────────────
+
+    function _depositAs(Vault v, address who, uint256 amt) internal returns (uint256 shares) {
+        usdc.mint(who, amt);
+        vm.startPrank(who);
+        usdc.approve(address(v), amt);
+        shares = v.deposit(amt, 0);
+        vm.stopPrank();
+    }
+
+    function _pathToUsdc(address token) internal view returns (address[] memory path) {
+        path = new address[](2);
+        path[0] = token;
+        path[1] = address(usdc);
+    }
+
+    /// @dev #1: only super-admin or an allowlisted creator can create vaults.
+    function test_CreateVault_RevertsForNonAllowlistedCaller() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ZenoIndexVault.NotVaultCreator.selector);
+        zenoIndexVault.createVault(_singleAssetParams(assetA));
+
+        zenoIndexVault.setVaultCreator(manager, false);
+        vm.prank(manager);
+        vm.expectRevert(ZenoIndexVault.NotVaultCreator.selector);
+        zenoIndexVault.createVault(_singleAssetParams(assetA));
+
+        // Super-admin (this contract) always can.
+        uint64 id = zenoIndexVault.createVault(_singleAssetParams(assetA));
+        assertTrue(zenoIndexVault.isVaultClone(zenoIndexVault.vaultClones(id)));
+    }
+
+    /// @dev Deploy item: a vault can't be created over an unpriced asset.
+    function test_CreateVault_RevertsWhenAssetHasNoPrice() public {
+        MockERC20 unpriced = new MockERC20("Unpriced", "UNP", 6);
+        uint64 id = zenoIndexVault.createAsset(address(unpriced));
+        vm.prank(manager);
+        vm.expectRevert(ZenoIndexVault.NoPrice.selector);
+        zenoIndexVault.createVault(_singleAssetParams(id));
+    }
+
+    /// @dev #2: zero price rejected; one update can't move a price past maxPriceChangeBps.
+    function test_SetPrice_RejectsZeroAndOversizedMove() public {
+        vm.expectRevert(ZenoIndexVault.ZeroPrice.selector);
+        zenoIndexVault.setPriceWhole(address(tokenA), 0);
+
+        // Default bound is 20%: $1 -> $1.20 ok, $1.20 -> $0.50 not.
+        zenoIndexVault.setPriceWhole(address(tokenA), 1_200_000);
+        vm.expectRevert(abi.encodeWithSelector(ZenoIndexVault.PriceChangeTooLarge.selector, address(tokenA)));
+        zenoIndexVault.setPriceWhole(address(tokenA), 500_000);
+
+        // Bound can be lifted deliberately for a real repricing.
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        zenoIndexVault.setPriceWhole(address(tokenA), 500_000);
+        assertEq(zenoIndexVault.valueUsdc(address(tokenA), 1e6), 500_000);
+    }
+
+    /// @dev #2: a price older than maxPriceAge blocks NAV reads (and so deposits).
+    function test_StalePrice_BlocksDepositUntilRefreshed() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        vm.warp(block.timestamp + zenoIndexVault.maxPriceAge() + 1);
+        usdc.mint(user, 1e6);
+        vm.startPrank(user);
+        usdc.approve(address(v), 1e6);
+        vm.expectRevert(abi.encodeWithSelector(ZenoIndexVault.StalePrice.selector, address(tokenA)));
+        v.deposit(1e6, 0);
+        vm.stopPrank();
+
+        zenoIndexVault.setPriceWhole(address(tokenA), 1_000_000);
+        zenoIndexVault.setPriceWhole(address(tokenB), 1_000_000);
+        vm.prank(user);
+        assertGt(v.deposit(1e6, 0), 0);
+    }
+
+    /// @dev #3: a redeem whose every leg rounds to 0 is rejected instead of opening a
+    ///      redeem that can never be claimed (which used to freeze write-off/retire).
+    function test_RequestRedeem_RevertsWhenEverythingRoundsToZero() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+        _depositAs(v, user, 1_000e6);
+        vm.startPrank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        v.swapUsdcToAsset(1, _pathUsdcTo(address(tokenB)), 0);
+        vm.stopPrank();
+
+        vm.prank(user);
+        vm.expectRevert(Vault.ZeroAmount.selector);
+        v.requestRedeem(1);
+        assertEq(v.activeRedeemCount(), 0);
+    }
+
+    /// @dev #4 is covered in AccessMaster.t.sol. #5: operators are per vault.
+    function test_Operators_AreScopedPerVault() public {
+        Vault v1 = _createDirectVault(0, 50, 0);
+        Vault v2 = _createDirectVault(0, 50, 0);
+        address op = address(0x0FE);
+
+        // A global AccessMaster operator no longer has manager powers on any vault.
+        accessMaster.addOperator(op);
+        vm.prank(op);
+        vm.expectRevert(Vault.NotVaultManager.selector);
+        v1.setPaused(true);
+
+        zenoIndexVault.setVaultOperator(0, op, true);
+        vm.prank(op);
+        v1.setPaused(true);
+        assertTrue(v1.paused());
+
+        vm.prank(op);
+        vm.expectRevert(Vault.NotVaultManager.selector);
+        v2.setPaused(true);
+    }
+
+    /// @dev #5: minOut = 0 is raised to the price-table floor, so a swap far off the
+    ///      oracle price reverts even when the manager passes no slippage bound.
+    function test_Swap_PriceTableFloorOverridesZeroMinOut() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        // Oracle says A is worth $0.50, so 0.6 USDC "should" buy ~1.2 A; the 1:1 pool
+        // gives ~0.6 A — far under the 3% floor.
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        zenoIndexVault.setPriceWhole(address(tokenA), 500_000);
+
+        vm.prank(manager);
+        vm.expectRevert();
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+
+        zenoIndexVault.setPriceWhole(address(tokenA), 1_000_000);
+        vm.prank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        assertGt(tokenA.balanceOf(address(v)), 0);
+    }
+
+    /// @dev #6: the deposit token is frozen once a vault exists.
+    function test_SetUsdcToken_RevertsOnceAVaultExists() public {
+        zenoIndexVault.setUsdcToken(address(usdc)); // fine before any vault
+        _createDirectVault(0, 50, 0);
+        vm.expectRevert(ZenoIndexVault.VaultsExist.selector);
+        zenoIndexVault.setUsdcToken(address(0x1234));
+    }
+
+    /// @dev #7: emergency halts deposits and every swap path; in-kind exit still works.
+    function test_Emergency_HaltsDepositsAndSwapsButNotInKindExit() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _depositAs(v, user, 100e6);
+        vm.startPrank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        v.swapUsdcToAsset(1, _pathUsdcTo(address(tokenB)), 0);
+        vm.stopPrank();
+        uint256 shares = ShareToken(v.sharesToken()).balanceOf(user);
+        vm.prank(user);
+        v.requestRedeem(shares);
+
+        zenoIndexVault.setEmergency(true);
+
+        usdc.mint(user, 1e6);
+        vm.startPrank(user);
+        usdc.approve(address(v), 1e6);
+        vm.expectRevert(Vault.EmergencyActive.selector);
+        v.deposit(1e6, 0);
+
+        vm.expectRevert(ZenoIndexVault.Emergency.selector);
+        v.swapAssetToUsdc(0, _pathToUsdc(address(tokenA)), 0);
+        vm.stopPrank();
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.EmergencyActive.selector);
+        v.executeRebalance(0, _pathToUsdc(address(tokenA)), 0);
+
+        // Price corrections stay possible while frozen.
+        zenoIndexVault.setPriceWhole(address(tokenA), 1_050_000);
+
+        vm.prank(user);
+        v.claimInKind();
+        assertGt(tokenA.balanceOf(user), 0);
+        assertEq(v.activeRedeemCount(), 0);
+    }
+
+    /// @dev #7: manager pause halts manager swaps/rebalance too, not only deposits.
+    function test_Pause_HaltsManagerSwapsAndRebalance() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        vm.startPrank(manager);
+        v.setPaused(true);
+        vm.expectRevert(Vault.VaultPaused.selector);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        vm.expectRevert(Vault.VaultPaused.selector);
+        v.executeRebalance(0, _pathToUsdc(address(tokenA)), 0);
+        vm.stopPrank();
+    }
+
+    /// @dev #8: claimInKind pays unswapped legs in the asset (less redeem fee) plus escrow.
+    function test_ClaimInKind_SettlesUnswappedLegsInAsset() public {
+        Vault v = _createDirectVault(0, 100, 0);
+        _genesis(v, 1_000_000_000);
+        _depositAs(v, user, 100e6);
+        vm.startPrank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        v.swapUsdcToAsset(1, _pathUsdcTo(address(tokenB)), 0);
+        vm.stopPrank();
+
+        uint256 shares = ShareToken(v.sharesToken()).balanceOf(user);
+        vm.startPrank(user);
+        v.requestRedeem(shares);
+        (uint256 legA,) = v.getRedeemAssetAmount(user, 0);
+        (uint256 legB,) = v.getRedeemAssetAmount(user, 1);
+        v.swapAssetToUsdc(0, _pathToUsdc(address(tokenA)), 0); // swap A, leave B in-kind
+        uint256 usdcBefore = usdc.balanceOf(user);
+        v.claimInKind();
+        vm.stopPrank();
+
+        assertGt(legA, 0);
+        assertEq(tokenB.balanceOf(user), legB - (legB * 100) / 10_000, "B paid in-kind less 1% fee");
+        assertGt(usdc.balanceOf(user), usdcBefore, "escrowed USDC from A paid too");
+        assertEq(v.reservedAt(1), 0);
+        assertEq(v.activeRedeemCount(), 0);
+    }
+
+    /// @dev #8: an abandoned redeem can be force-settled by anyone after the timeout, so
+    ///      it can't block slot retirement / write-off forever.
+    function test_ForceSettleRedeem_OnlyAfterTimeout() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _depositAs(v, user, 100e6);
+        vm.startPrank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        v.swapUsdcToAsset(1, _pathUsdcTo(address(tokenB)), 0);
+        vm.stopPrank();
+        uint256 shares = ShareToken(v.sharesToken()).balanceOf(user);
+        vm.prank(user);
+        v.requestRedeem(shares);
+
+        vm.prank(address(0xCAFE));
+        vm.expectRevert(Vault.RedeemNotTimedOut.selector);
+        v.forceSettleRedeem(user);
+
+        vm.warp(block.timestamp + Constants.REDEEM_TIMEOUT);
+        vm.prank(address(0xCAFE));
+        v.forceSettleRedeem(user);
+
+        assertEq(v.activeRedeemCount(), 0);
+        assertGt(tokenA.balanceOf(user), 0, "proceeds go to the redeemer, not the caller");
+        assertEq(tokenA.balanceOf(address(0xCAFE)), 0);
+    }
+
+    /// @dev #9: previewDeposit applies the same share-cap clamp as deposit, and the
+    ///      clamped deposit earmarks exactly the net cash it kept.
+    function test_PreviewDeposit_MatchesClampedDeposit() public {
+        Vault v = _createDirectVault(100, 50, 5_000_000);
+        _genesis(v, 1_000_000_000); // 1_000_000 genesis shares, cap 5_000_000
+
+        uint256 amt = 50e6; // would mint ~49.5M shares, far past the cap
+        (uint256 previewShares, uint256 previewNet,,) = v.previewDeposit(amt);
+        assertLe(previewShares, 4_000_000);
+
+        uint256 pendingBefore = v.totalPendingUsdc();
+        usdc.mint(user, amt);
+        vm.startPrank(user);
+        usdc.approve(address(v), amt);
+        uint256 minted = v.deposit(amt, previewShares);
+        vm.stopPrank();
+
+        assertEq(minted, previewShares);
+        assertLe(v.totalShares(), 5_000_000);
+        assertLe(v.totalPendingUsdc() - pendingBefore, previewNet, "never earmark more than the net kept");
+    }
+
+    /// @dev #13: executeSwap is callable only by registered clones, for their own tokens.
+    function test_ExecuteSwap_RevertsForNonClone() public {
+        vm.expectRevert(ZenoIndexVault.NotVaultClone.selector);
+        zenoIndexVault.executeSwap(_pathUsdcTo(address(tokenA)), 1e6, 0, user, address(this));
+    }
+
+    /// @dev Also-fix: fee recipient can't be zeroed.
+    function test_SetFeeRecipient_RevertsOnZero() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        vm.prank(manager);
+        vm.expectRevert(Vault.ZeroAddress.selector);
+        v.setFeeRecipient(address(0));
+    }
+
+    /// @dev New finding: with USDC as a basket slot, a redeemer's USDC-slot share must not
+    ///      include cash that is pending deployment or escrowed for other redeemers.
+    function test_RequestRedeem_UsdcSlotExcludesPendingAndEscrow() public {
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        uint64 usdcAsset = zenoIndexVault.createAsset(address(usdc));
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = usdcAsset;
+        ids[1] = assetA;
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 5000;
+        bps[1] = 5000;
+        ZenoIndexVault.CreateVaultParams memory p = _singleAssetParams(assetA);
+        p.assetIds = ids;
+        p.allocationBps = bps;
+        vm.prank(manager);
+        Vault v = Vault(zenoIndexVault.vaultClones(zenoIndexVault.createVault(p)));
+        _genesis(v, 1_000_000_000);
+
+        _depositAs(v, user, 100e6); // 50 stays USDC, 50 pending for A (undeployed)
+        uint256 navBefore = v.totalNav();
+        uint256 shares = ShareToken(v.sharesToken()).balanceOf(user);
+        uint256 total = v.totalShares();
+
+        vm.prank(user);
+        v.requestRedeem(shares);
+
+        uint256 fairShare = (navBefore * shares) / total;
+        assertApproxEqAbs(v.redeemUsdcBal(user), fairShare, 2, "USDC credit = fair share, no double count");
     }
 }

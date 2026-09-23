@@ -2,7 +2,8 @@
 pragma solidity ^0.8.13;
 
 import {ISwapRouter} from "../interfaces/ISwapRouter.sol";
-import {ERC20Minimal} from "../tokens/ERC20Minimal.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
@@ -15,13 +16,23 @@ import {TickMath} from "v4-core/libraries/TickMath.sol";
 /// @notice ISwapRouter adapter that routes ZenoIndexVault swaps through a Uniswap V4 PoolManager,
 ///         chaining a caller-supplied hop path (e.g. [USDC, WETH, DOG]) across consecutive
 ///         per-pair pools. Each hop is exact-input, single-pool, admin-registered.
+///         `swap` pulls from an arbitrary `from`, so only admin-authorized callers (the
+///         ZenoIndexVault factory) may invoke it — otherwise anyone could spend another
+///         account's allowance to this adapter.
 contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
+    using SafeERC20 for IERC20;
+
     IPoolManager public immutable poolManager;
     address public admin;
 
     /// @dev keccak256(sorted tokenA, tokenB) => registered pool for that adjacent pair.
     mapping(bytes32 => PoolKey) public pools;
     mapping(bytes32 => bool) public poolSet;
+
+    /// @notice Contracts allowed to call `swap`.
+    mapping(address => bool) public isAuthorizedCaller;
+    /// @notice Hook contracts a registered pool may use (address(0) = no hook, always allowed).
+    mapping(address => bool) public isHookAllowed;
 
     struct HopData {
         PoolKey key;
@@ -40,6 +51,8 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
 
     event PoolRegistered(address indexed tokenA, address indexed tokenB, uint24 fee, int24 tickSpacing, address hooks);
     event AdminChanged(address indexed newAdmin);
+    event AuthorizedCallerSet(address indexed caller, bool allowed);
+    event HookAllowedSet(address indexed hook, bool allowed);
 
     error OnlyAdmin();
     error OnlyPoolManager();
@@ -47,6 +60,8 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
     error SlippageExceeded(uint256 amountOut, uint256 minAmountOut);
     error ZeroAddress();
     error InvalidPath();
+    error NotAuthorizedCaller();
+    error HookNotAllowed();
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert OnlyAdmin();
@@ -65,6 +80,19 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
         emit AdminChanged(newAdmin);
     }
 
+    function setAuthorizedCaller(address caller, bool allowed) external onlyAdmin {
+        if (caller == address(0)) revert ZeroAddress();
+        isAuthorizedCaller[caller] = allowed;
+        emit AuthorizedCallerSet(caller, allowed);
+    }
+
+    /// @notice Allowlists a hook contract; a hook can skew fills, so each must be reviewed.
+    function setHookAllowed(address hook, bool allowed) external onlyAdmin {
+        if (hook == address(0)) revert ZeroAddress();
+        isHookAllowed[hook] = allowed;
+        emit HookAllowedSet(hook, allowed);
+    }
+
     /// @notice Registers the V4 pool used to swap between `tokenA` and `tokenB` directly
     ///         (one adjacent hop in a caller-supplied path).
     function setPool(address tokenA, address tokenB, uint24 fee, int24 tickSpacing, address hooks)
@@ -72,6 +100,7 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
         onlyAdmin
     {
         if (tokenA == address(0) || tokenB == address(0)) revert ZeroAddress();
+        if (hooks != address(0) && !isHookAllowed[hooks]) revert HookNotAllowed();
         (address currency0, address currency1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
 
         PoolKey memory key = PoolKey({
@@ -96,12 +125,13 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
         address from,
         address to
     ) external returns (uint256 amountOut) {
+        if (!isAuthorizedCaller[msg.sender]) revert NotAuthorizedCaller();
         if (path.length < 2) revert InvalidPath();
         for (uint256 i = 0; i < path.length - 1; i++) {
             if (!poolSet[_pairId(path[i], path[i + 1])]) revert PoolNotSet();
         }
 
-        require(ERC20Minimal(path[0]).transferFrom(from, address(this), amountIn), "IN");
+        IERC20(path[0]).safeTransferFrom(from, address(this), amountIn);
 
         bytes memory result = poolManager.unlock(abi.encode(SwapData({
             path: path,
@@ -142,7 +172,7 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
             uint256 hopAmountOut = uint256(uint128(outDelta));
 
             poolManager.sync(inCurrency);
-            require(ERC20Minimal(Currency.unwrap(inCurrency)).transfer(address(poolManager), hopAmountIn), "PAY");
+            IERC20(Currency.unwrap(inCurrency)).safeTransfer(address(poolManager), hopAmountIn);
             poolManager.settle();
 
             // Intermediate hops keep proceeds in this adapter to feed the next hop;
@@ -154,9 +184,7 @@ contract UniswapV4Adapter is ISwapRouter, IUnlockCallback {
                 // Partial fill on a non-final hop would desync accounting; only supported
                 // cleanly on the first hop where a refund target (`from`) is well-defined.
                 require(i == 0, "PARTIAL_MID_HOP");
-                require(
-                    ERC20Minimal(Currency.unwrap(inCurrency)).transfer(data.from, currentAmount - hopAmountIn), "REFUND"
-                );
+                IERC20(Currency.unwrap(inCurrency)).safeTransfer(data.from, currentAmount - hopAmountIn);
             }
 
             currentAmount = hopAmountOut;

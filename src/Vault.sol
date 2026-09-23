@@ -3,9 +3,10 @@ pragma solidity ^0.8.13;
 
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IZenoIndexVault} from "./interfaces/IZenoIndexVault.sol";
 import {IVault} from "./interfaces/IVault.sol";
-import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 import {ERC20Minimal} from "./tokens/ERC20Minimal.sol";
 import {ShareToken} from "./tokens/ShareToken.sol";
 import {VaultMath} from "./libraries/VaultMath.sol";
@@ -15,6 +16,8 @@ import {Constants} from "./libraries/Constants.sol";
 ///         Reads NAV/valuation, swap execution, and role/asset-registry data live from
 ///         `zenoIndexVault` on every call — never caches them.
 contract Vault is Initializable, ReentrancyGuard, IVault {
+    using SafeERC20 for IERC20;
+
     // ── Enums ─────────────────────────────────────────────────────────────────
     enum FundType {
         Fixed,
@@ -26,6 +29,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     struct RedeemState {
         bool isRedeemActive;
         uint8 numAssets;
+        uint64 requestedAt;
         uint256[20] assetAmountIn;
         bool[20] assetSwapped;
     }
@@ -78,10 +82,19 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     mapping(address => uint256) public redeemUsdcBal;
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
+    /// @dev Manager, or an operator super-admin scoped to THIS vault on ZenoIndexVault.
     modifier onlyManager() {
-        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isOperator(msg.sender)) {
+        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isVaultOperator(address(this), msg.sender))
+        {
             revert NotVaultManager();
         }
+        _;
+    }
+
+    /// @dev Manager-driven value moves (genesis, deployment swaps, rebalance) halt on
+    ///      manager pause, super-admin lock, or protocol emergency.
+    modifier whenActive() {
+        _checkActive();
         _;
     }
 
@@ -105,6 +118,9 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     event WriteOffExecuted(uint64 assetId, uint256 balanceAtWriteOff, uint256 lastNavContribution);
     event ReactivateProposed(uint64 assetId);
     event ReactivateExecuted(uint64 assetId, uint256 restoredBalance);
+    event WrittenOffSwept(uint64 assetId, address to, uint256 amount);
+    event RedeemSettledInKind(address user, address caller, uint256 usdcPaid);
+    event SlotRetired(uint64 assetId, uint256 dustLeft);
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error NotVaultManager();
@@ -123,7 +139,6 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     error InsufficientShares();
     error RedeemAlreadyPending();
     error RedeemInactive();
-    error NothingToClaim();
     error AssetNotSwapped();
     error AssetAlreadySwapped();
     error InvalidAssetIndex();
@@ -139,6 +154,10 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     error PathEnd();
     error AssetNotRegistered();
     error AssetNotActive();
+    error ZeroAddress();
+    error EmergencyActive();
+    error RedeemNotTimedOut();
+    error UsdcNotWriteOffable();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -211,6 +230,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     }
 
     function setFeeRecipient(address feeRecipient_) external onlyManager {
+        if (feeRecipient_ == address(0)) revert ZeroAddress();
         feeRecipient = feeRecipient_;
     }
 
@@ -220,7 +240,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
     // ── Genesis + Deposit ─────────────────────────────────────────────────────
 
-    function genesisDeposit(uint256 baselineSharePrice_) external onlyManager nonReentrant {
+    function genesisDeposit(uint256 baselineSharePrice_) external onlyManager whenActive nonReentrant {
         if (genesisDone) revert GenesisAlreadySeeded();
 
         uint256 genesisShares =
@@ -235,7 +255,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         _recordPendingTargets(Constants.GENESIS_SEED_USDC);
 
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        require(ERC20Minimal(usdc).transferFrom(msg.sender, address(this), Constants.GENESIS_SEED_USDC), "PULL");
+        IERC20(usdc).safeTransferFrom(msg.sender, address(this), Constants.GENESIS_SEED_USDC);
         ShareToken(sharesToken).mint(address(this), genesisShares);
 
         emit GenesisSeeded(msg.sender, Constants.GENESIS_SEED_USDC, baselineSharePrice_, genesisShares);
@@ -243,47 +263,27 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
     function deposit(uint256 usdcAmount, uint256 minSharesOut) external nonReentrant returns (uint256 sharesMinted) {
         if (usdcAmount == 0) revert ZeroAmount();
-        if (paused) revert VaultPaused();
-        if (adminLocked) revert VaultAdminLocked();
+        _checkActive();
         if (!genesisDone) revert GenesisNotSeeded();
+        if (maxShares > 0 && totalShares >= maxShares) revert ShareCapExceeded();
 
-        uint256 navAssets = _sumNav();
-        uint256 pendingUsdc = totalPendingUsdc;
-        uint256 totalShares_ = totalShares;
-
-        uint256 depositFee = (usdcAmount * uint256(depositFeeBps)) / Constants.BPS_DENOM;
-        uint256 netUsdc = usdcAmount - depositFee;
-        if (netUsdc == 0) revert ZeroAmount();
-
-        sharesMinted = VaultMath.computeSharesToMint(netUsdc, totalShares_, navAssets, pendingUsdc);
-        if (sharesMinted == 0) revert ZeroAmount();
-
-        if (maxShares > 0 && totalShares_ + sharesMinted > maxShares) {
-            uint256 remaining = maxShares - totalShares_;
-            if (remaining == 0) revert ShareCapExceeded();
-            uint256 navPlusPending = navAssets + pendingUsdc;
-            uint256 clampedNet = VaultMath.computeUsdcForShares(remaining, totalShares_, navPlusPending);
-            if (clampedNet == 0) revert ZeroAmount();
-            uint256 clampedGross = (clampedNet * usdcAmount) / netUsdc;
-            usdcAmount = clampedGross;
-            netUsdc = clampedNet;
-            sharesMinted = remaining;
-        }
-
+        uint256 grossUsdc;
+        VaultMath.FeeSplit memory fee;
+        (sharesMinted, grossUsdc, fee) = _quoteDeposit(usdcAmount);
+        if (fee.netAmount == 0 || sharesMinted == 0) revert ZeroAmount();
         if (sharesMinted < minSharesOut) revert SlippageExceeded();
 
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        require(ERC20Minimal(usdc).transferFrom(msg.sender, address(this), usdcAmount), "PULL");
-
-        VaultMath.FeeSplit memory fee = VaultMath.computeFeeSplit(usdcAmount, depositFeeBps);
+        IERC20(usdc).safeTransferFrom(msg.sender, address(this), grossUsdc);
         _payFees(usdc, fee);
 
         ShareToken(sharesToken).mint(msg.sender, sharesMinted);
-        totalShares = totalShares_ + sharesMinted;
+        totalShares += sharesMinted;
 
-        _recordPendingTargets(netUsdc);
+        // Earmark exactly the net cash kept, as computed from the (possibly clamped) gross.
+        _recordPendingTargets(fee.netAmount);
 
-        emit Deposit(msg.sender, usdcAmount, netUsdc, fee.companyFee, fee.managerFee, sharesMinted);
+        emit Deposit(msg.sender, grossUsdc, fee.netAmount, fee.companyFee, fee.managerFee, sharesMinted);
     }
 
     // ── Redeem / claim ────────────────────────────────────────────────────────
@@ -298,15 +298,34 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
         uint8 n = numAssets;
         uint256 totalShares_ = totalShares;
+        address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
 
         uint256[20] memory freeBalances;
+        bool[20] memory isUsdcSlot;
         for (uint8 i = 0; i < n; i++) {
-            (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(_assetIds[i]);
-            uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
-            freeBalances[i] = bal > _reservedAssets[i] ? bal - _reservedAssets[i] : 0;
+            address mint;
+            (freeBalances[i], mint) = _freeBalance(i, usdc);
+            isUsdcSlot[i] = (mint == usdc);
         }
 
         uint256[20] memory amounts = VaultMath.computeRedeemSwapAmounts(freeBalances, n, shares, totalShares_);
+
+        VaultMath.PendingCarve memory carve =
+            VaultMath.computePendingCarve(totalPendingUsdc, _usdcTargetAmount, n, shares, totalShares_);
+
+        // A USDC slot's share is already USDC — credit it to escrow directly, no swap leg.
+        uint256 usdcCredit = carve.usdcSlice;
+        bool anySwapLeg;
+        for (uint8 i = 0; i < n; i++) {
+            if (isUsdcSlot[i]) {
+                usdcCredit += amounts[i];
+                amounts[i] = 0;
+            } else if (amounts[i] > 0) {
+                anySwapLeg = true;
+            }
+        }
+        // Everything rounded to zero — reject rather than open a redeem that can never close.
+        if (usdcCredit == 0 && !anySwapLeg) revert ZeroAmount();
 
         ShareToken(sharesToken).burn(msg.sender, shares);
         totalShares = totalShares_ - shares;
@@ -315,48 +334,55 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             _reservedAssets[i] += amounts[i];
         }
 
-        VaultMath.PendingCarve memory carve =
-            VaultMath.computePendingCarve(totalPendingUsdc, _usdcTargetAmount, n, shares, totalShares_);
         totalPendingUsdc = carve.totalPendingUsdc;
         _usdcTargetAmount = carve.usdcTargetAmount;
 
-        if (carve.usdcSlice > 0) {
-            redeemUsdcBal[msg.sender] += carve.usdcSlice;
-            vaultRedeemEscrowTotal += carve.usdcSlice;
+        if (usdcCredit > 0) {
+            redeemUsdcBal[msg.sender] += usdcCredit;
+            vaultRedeemEscrowTotal += usdcCredit;
         }
 
         rs.isRedeemActive = true;
         rs.numAssets = n;
+        rs.requestedAt = uint64(block.timestamp);
         rs.assetAmountIn = amounts;
         for (uint8 i = 0; i < n; i++) {
             rs.assetSwapped[i] = (amounts[i] == 0);
         }
         activeRedeemCount += 1;
 
-        emit RequestRedeem(msg.sender, shares, carve.usdcSlice);
+        emit RequestRedeem(msg.sender, shares, usdcCredit);
     }
 
     function claim() external nonReentrant {
         RedeemState storage rs = redeemStates[msg.sender];
         if (!rs.isRedeemActive) revert RedeemInactive();
 
-        uint256 grossUsdc = redeemUsdcBal[msg.sender];
-        if (grossUsdc == 0) revert NothingToClaim();
-
         for (uint8 i = 0; i < rs.numAssets; i++) {
             if (!rs.assetSwapped[i]) revert AssetNotSwapped();
         }
 
-        VaultMath.FeeSplit memory fee = VaultMath.computeFeeSplit(grossUsdc, redeemFeeBps);
-        redeemUsdcBal[msg.sender] = 0;
-        vaultRedeemEscrowTotal -= grossUsdc;
-
-        address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        _payFees(usdc, fee);
-        require(ERC20Minimal(usdc).transfer(msg.sender, fee.netAmount), "XFER");
-
+        // A zero escrow (every swap leg filled for 0) still closes the redeem.
+        (uint256 grossUsdc, VaultMath.FeeSplit memory fee) = _payOutEscrow(msg.sender);
         _resetRedeem(rs);
         emit Claim(msg.sender, grossUsdc, fee.companyFee, fee.managerFee, fee.netAmount);
+    }
+
+    /// @notice Closes the caller's redeem without swapping: every leg not yet swapped is
+    ///         paid out in the asset itself (less the redeem fee, taken in-kind), plus the
+    ///         escrowed USDC. Works during pause/lock/emergency — it is the exit of last resort.
+    function claimInKind() external nonReentrant {
+        _settleInKind(msg.sender);
+    }
+
+    /// @notice Anyone may settle `user`'s redeem in-kind once it has been open for
+    ///         `Constants.REDEEM_TIMEOUT` — so an abandoned redeem cannot block slot
+    ///         retirement / write-off for the whole vault forever. Proceeds go to `user`.
+    function forceSettleRedeem(address user) external nonReentrant {
+        RedeemState storage rs = redeemStates[user];
+        if (!rs.isRedeemActive) revert RedeemInactive();
+        if (block.timestamp < uint256(rs.requestedAt) + Constants.REDEEM_TIMEOUT) revert RedeemNotTimedOut();
+        _settleInKind(user);
     }
 
     // ── Inflow deployment leg ─────────────────────────────────────────────────
@@ -364,6 +390,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     function swapUsdcToAsset(uint8 assetIndex, address[] calldata path, uint256 minAssetOut)
         external
         onlyManager
+        whenActive
         nonReentrant
     {
         if (assetIndex >= numAssets) revert InvalidAssetIndex();
@@ -375,11 +402,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         require(path[0] == usdc, "PATH_START");
         if (path[path.length - 1] != mint) revert PathEnd();
 
-        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
-        ERC20Minimal(usdc).approve(routerAddr, amount);
-        uint256 assetOut =
-            IZenoIndexVault(zenoIndexVault).executeSwap(path, amount, minAssetOut, address(this), address(this));
-        ERC20Minimal(usdc).approve(routerAddr, 0);
+        uint256 assetOut = _swap(path, amount, minAssetOut);
 
         totalPendingUsdc = totalPendingUsdc > amount ? totalPendingUsdc - amount : 0;
         _usdcTargetAmount[assetIndex] = 0;
@@ -390,6 +413,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     // ── Redeem unwind leg ─────────────────────────────────────────────────────
 
     function swapAssetToUsdc(uint8 assetIndex, address[] calldata path, uint256 minUsdcOut) external nonReentrant {
+        if (adminLocked) revert VaultAdminLocked();
         RedeemState storage rs = redeemStates[msg.sender];
         if (!rs.isRedeemActive) revert RedeemInactive();
         if (assetIndex >= numAssets) revert InvalidAssetIndex();
@@ -402,11 +426,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         uint256 assetAmount = rs.assetAmountIn[assetIndex];
         if (assetAmount == 0) revert ZeroAmount();
 
-        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
-        ERC20Minimal(mint).approve(routerAddr, assetAmount);
-        uint256 usdcOut =
-            IZenoIndexVault(zenoIndexVault).executeSwap(path, assetAmount, minUsdcOut, address(this), address(this));
-        ERC20Minimal(mint).approve(routerAddr, 0);
+        uint256 usdcOut = _swap(path, assetAmount, minUsdcOut);
 
         redeemUsdcBal[msg.sender] += usdcOut;
         vaultRedeemEscrowTotal += usdcOut;
@@ -492,70 +512,42 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     }
 
     /// @notice Trades ONLY the delta between assetIndex's current NAV weight and its target.
-    ///         Skips (no-op) if within Constants.REBALANCE_DRIFT_BPS of target. Manager-only.
+    ///         Skips (no-op) if within Constants.REBALANCE_DRIFT_BPS of target. A 0%-target
+    ///         (winding-down) slot instead sells its WHOLE free balance, and retires once
+    ///         what is left is worth at most Constants.RETIRE_DUST_USDC. Manager-only.
     function executeRebalance(uint8 assetIndex, address[] calldata path, uint256 minOut)
         external
         onlyManager
+        whenActive
         nonReentrant
     {
         if (assetIndex >= numAssets) revert InvalidAssetIndex();
 
-        uint256 nav = _sumNav();
-        if (nav == 0) return;
-
-        (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(_assetIds[assetIndex]);
-        uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
-        uint256 free = bal > _reservedAssets[assetIndex] ? bal - _reservedAssets[assetIndex] : 0;
-
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        uint256 currentValueUsdc = IZenoIndexVault(zenoIndexVault).valueUsdc(mint, free);
-
-        uint256 currentBps = (currentValueUsdc * Constants.BPS_DENOM) / nav;
+        (uint256 free, address mint) = _freeBalance(assetIndex, usdc);
         uint256 targetBps = _allocationBps[assetIndex];
 
-        uint256 driftBps = currentBps > targetBps ? currentBps - targetBps : targetBps - currentBps;
-        if (driftBps <= Constants.REBALANCE_DRIFT_BPS) return;
-
-        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
-
-        if (currentBps > targetBps) {
-            // Overweight: sell the delta down to USDC — path must start at the asset and
-            // end at USDC (a caller-chosen intermediate hub is allowed in between).
-            uint256 deltaValueUsdc = ((currentBps - targetBps) * nav) / Constants.BPS_DENOM;
-            uint256 sellAmount = currentValueUsdc == 0 ? 0 : (free * deltaValueUsdc) / currentValueUsdc;
-            if (sellAmount == 0) return;
-            require(path[0] == mint, "PATH_START");
-            if (path[path.length - 1] != usdc) revert PathEnd();
-            ERC20Minimal(mint).approve(routerAddr, sellAmount);
-            IZenoIndexVault(zenoIndexVault).executeSwap(path, sellAmount, minOut, address(this), address(this));
-            ERC20Minimal(mint).approve(routerAddr, 0);
-            emit RebalanceExecuted(assetIndex, sellAmount, true);
+        if (targetBps == 0) {
+            // Wind-down: sell everything free (a USDC slot has nothing to sell — its cash is
+            // redeployed by buying other slots).
+            if (mint != usdc && free > 0 && _value(mint, free, usdc) > Constants.RETIRE_DUST_USDC) {
+                _requirePath(path, mint, usdc);
+                _swap(path, free, minOut);
+                emit RebalanceExecuted(assetIndex, free, true);
+            }
         } else {
-            // Underweight: buy the delta, funded only from USDC that isn't already earmarked
-            // for another asset's deployment leg (totalPendingUsdc) or owed to redeemers
-            // in escrow (vaultRedeemEscrowTotal) — spending either would leave those
-            // obligations unbacked by real balance.
-            uint256 deltaValueUsdc = ((targetBps - currentBps) * nav) / Constants.BPS_DENOM;
-            uint256 usdcBal = ERC20Minimal(usdc).balanceOf(address(this));
-            uint256 earmarked = totalPendingUsdc + vaultRedeemEscrowTotal;
-            uint256 usdcFree = usdcBal > earmarked ? usdcBal - earmarked : 0;
-            uint256 buyAmount = deltaValueUsdc < usdcFree ? deltaValueUsdc : usdcFree;
-            if (buyAmount == 0) return;
-            require(path[0] == usdc, "PATH_START");
-            if (path[path.length - 1] != mint) revert PathEnd();
-            ERC20Minimal(usdc).approve(routerAddr, buyAmount);
-            IZenoIndexVault(zenoIndexVault).executeSwap(path, buyAmount, minOut, address(this), address(this));
-            ERC20Minimal(usdc).approve(routerAddr, 0);
-            emit RebalanceExecuted(assetIndex, buyAmount, false);
+            _rebalanceTowardTarget(assetIndex, path, minOut, mint, usdc, free, targetBps);
         }
 
-        // If this slot's target is 0 and its balance has hit zero, compact it out — but
-        // only when no redeem is in flight (see _retireSlot). Skipping here is safe: the
-        // slot just stays at 0% until a later rebalance call retires it once redeems clear.
-        if (_allocationBps[assetIndex] == 0) {
-            uint256 remainingBal = ERC20Minimal(mint).balanceOf(address(this));
-            if (remainingBal == 0 && _reservedAssets[assetIndex] == 0 && activeRedeemCount == 0) {
+        // Retire a 0% slot once only dust remains — but only when no redeem is in flight
+        // (see _retireSlot). Skipping here is safe: the slot just stays at 0% until a later
+        // rebalance call retires it once redeems clear.
+        if (targetBps == 0 && _reservedAssets[assetIndex] == 0 && activeRedeemCount == 0) {
+            (uint256 left,) = _freeBalance(assetIndex, usdc);
+            if (left == 0 || _value(mint, left, usdc) <= Constants.RETIRE_DUST_USDC) {
+                uint64 retiredId = _assetIds[assetIndex];
                 _retireSlot(assetIndex);
+                emit SlotRetired(retiredId, left);
             }
         }
     }
@@ -585,10 +577,16 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         // Block until every in-flight redeem clears (via claim).
         if (activeRedeemCount > 0) revert AssetReserved();
         (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(assetId);
+        // Writing off USDC would strand pending/escrowed cash (and a sweep would take it).
+        if (mint == IZenoIndexVault(zenoIndexVault).usdcToken()) revert UsdcNotWriteOffable();
         uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
         uint256 navContribution;
         if (bal > 0) {
-            navContribution = IZenoIndexVault(zenoIndexVault).valueUsdc(mint, bal);
+            // Informational only — a dead asset's price is often stale or unset, which
+            // must not block the write-off.
+            try IZenoIndexVault(zenoIndexVault).valueUsdc(mint, bal) returns (uint256 v) {
+                navContribution = v;
+            } catch {}
         }
 
         isWrittenOff[assetId] = true;
@@ -615,6 +613,17 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         numAssets = newSlot + 1;
 
         emit ReactivateExecuted(assetId, restoredBalance);
+    }
+
+    /// @dev Called only by ZenoIndexVault.sol (`onlyZenoIndexVault`), which itself enforces `onlySuperAdmin`.
+    function executeSweep(uint64 assetId, address to) external onlyZenoIndexVault nonReentrant {
+        if (!isWrittenOff[assetId]) revert NotWrittenOff();
+        if (to == address(0)) revert ZeroAddress();
+        (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(assetId);
+        uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
+        writtenOffBalance[assetId] = 0;
+        if (bal > 0) IERC20(mint).safeTransfer(to, bal);
+        emit WrittenOffSwept(assetId, to, bal);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -648,6 +657,98 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         numAssets = last;
     }
 
+    function _rebalanceTowardTarget(
+        uint8 assetIndex,
+        address[] calldata path,
+        uint256 minOut,
+        address mint,
+        address usdc,
+        uint256 free,
+        uint256 targetBps
+    ) internal {
+        uint256 nav = _sumNav();
+        if (nav == 0) return;
+
+        uint256 currentValueUsdc = _value(mint, free, usdc);
+        uint256 currentBps = (currentValueUsdc * Constants.BPS_DENOM) / nav;
+        uint256 driftBps = currentBps > targetBps ? currentBps - targetBps : targetBps - currentBps;
+        if (driftBps <= Constants.REBALANCE_DRIFT_BPS) return;
+
+        if (currentBps > targetBps) {
+            // Overweight: sell the delta down to USDC — path must start at the asset and
+            // end at USDC (a caller-chosen intermediate hub is allowed in between).
+            uint256 deltaValueUsdc = ((currentBps - targetBps) * nav) / Constants.BPS_DENOM;
+            uint256 sellAmount = currentValueUsdc == 0 ? 0 : (free * deltaValueUsdc) / currentValueUsdc;
+            if (sellAmount == 0) return;
+            _requirePath(path, mint, usdc);
+            _swap(path, sellAmount, minOut);
+            emit RebalanceExecuted(assetIndex, sellAmount, true);
+        } else {
+            // Underweight: buy the delta, funded only from USDC that isn't already earmarked
+            // for another asset's deployment leg (totalPendingUsdc) or owed to redeemers
+            // in escrow (vaultRedeemEscrowTotal) — spending either would leave those
+            // obligations unbacked by real balance.
+            uint256 deltaValueUsdc = ((targetBps - currentBps) * nav) / Constants.BPS_DENOM;
+            uint256 usdcBal = ERC20Minimal(usdc).balanceOf(address(this));
+            uint256 earmarked = totalPendingUsdc + vaultRedeemEscrowTotal;
+            uint256 usdcFree = usdcBal > earmarked ? usdcBal - earmarked : 0;
+            uint256 buyAmount = deltaValueUsdc < usdcFree ? deltaValueUsdc : usdcFree;
+            if (buyAmount == 0) return;
+            _requirePath(path, usdc, mint);
+            _swap(path, buyAmount, minOut);
+            emit RebalanceExecuted(assetIndex, buyAmount, false);
+        }
+    }
+
+    /// @dev Approves the router for exactly `amountIn`, swaps via ZenoIndexVault, resets the
+    ///      approval, and returns the output actually received (balance delta — never trusts
+    ///      the router's reported amount).
+    function _swap(address[] calldata path, uint256 amountIn, uint256 minOut) internal returns (uint256 received) {
+        IERC20 tokenIn = IERC20(path[0]);
+        IERC20 tokenOut = IERC20(path[path.length - 1]);
+        address routerAddr = IZenoIndexVault(zenoIndexVault).router();
+        uint256 outBefore = tokenOut.balanceOf(address(this));
+        tokenIn.forceApprove(routerAddr, amountIn);
+        IZenoIndexVault(zenoIndexVault).executeSwap(path, amountIn, minOut, address(this), address(this));
+        tokenIn.forceApprove(routerAddr, 0);
+        received = tokenOut.balanceOf(address(this)) - outBefore;
+        if (received < minOut) revert SlippageExceeded();
+    }
+
+    /// @dev Pays `user`'s escrowed USDC (less the redeem fee) and clears the escrow.
+    function _payOutEscrow(address user) internal returns (uint256 grossUsdc, VaultMath.FeeSplit memory fee) {
+        grossUsdc = redeemUsdcBal[user];
+        fee = VaultMath.computeFeeSplit(grossUsdc, redeemFeeBps);
+        if (grossUsdc == 0) return (grossUsdc, fee);
+        redeemUsdcBal[user] = 0;
+        vaultRedeemEscrowTotal -= grossUsdc;
+
+        address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
+        _payFees(usdc, fee);
+        IERC20(usdc).safeTransfer(user, fee.netAmount);
+    }
+
+    function _settleInKind(address user) internal {
+        RedeemState storage rs = redeemStates[user];
+        if (!rs.isRedeemActive) revert RedeemInactive();
+
+        // Slots cannot be compacted while any redeem is active, so rs indices still match.
+        for (uint8 i = 0; i < rs.numAssets; i++) {
+            if (rs.assetSwapped[i]) continue;
+            uint256 amount = rs.assetAmountIn[i];
+            rs.assetSwapped[i] = true;
+            _reservedAssets[i] = _reservedAssets[i] > amount ? _reservedAssets[i] - amount : 0;
+            (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(_assetIds[i]);
+            VaultMath.FeeSplit memory assetFee = VaultMath.computeFeeSplit(amount, redeemFeeBps);
+            _payFees(mint, assetFee);
+            if (assetFee.netAmount > 0) IERC20(mint).safeTransfer(user, assetFee.netAmount);
+        }
+
+        (uint256 grossUsdc,) = _payOutEscrow(user);
+        _resetRedeem(rs);
+        emit RedeemSettledInKind(user, msg.sender, grossUsdc);
+    }
+
     function _recordPendingTargets(uint256 netUsdc) internal {
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
         uint8 n = numAssets;
@@ -660,18 +761,19 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         }
     }
 
-    function _payFees(address usdc, VaultMath.FeeSplit memory fee) internal {
+    function _payFees(address token, VaultMath.FeeSplit memory fee) internal {
         if (fee.companyFee > 0) {
-            require(ERC20Minimal(usdc).transfer(IZenoIndexVault(zenoIndexVault).treasury(), fee.companyFee), "FEE_T");
+            IERC20(token).safeTransfer(IZenoIndexVault(zenoIndexVault).treasury(), fee.companyFee);
         }
         if (fee.managerFee > 0) {
-            require(ERC20Minimal(usdc).transfer(feeRecipient, fee.managerFee), "FEE_M");
+            IERC20(token).safeTransfer(feeRecipient, fee.managerFee);
         }
     }
 
     function _resetRedeem(RedeemState storage rs) internal {
         rs.isRedeemActive = false;
         rs.numAssets = 0;
+        rs.requestedAt = 0;
         for (uint8 i = 0; i < Constants.MAX_ASSETS; i++) {
             rs.assetAmountIn[i] = 0;
             rs.assetSwapped[i] = false;
@@ -712,12 +814,14 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         view
         returns (uint256 sharesOut, uint256 netUsdc, uint256 companyFee, uint256 managerFee)
     {
-        VaultMath.FeeSplit memory fee = VaultMath.computeFeeSplit(usdcAmount, depositFeeBps);
-        netUsdc = fee.netAmount;
-        companyFee = fee.companyFee;
-        managerFee = fee.managerFee;
-        if (!genesisDone || netUsdc == 0) return (0, netUsdc, companyFee, managerFee);
-        sharesOut = VaultMath.computeSharesToMint(netUsdc, totalShares, _sumNav(), totalPendingUsdc);
+        VaultMath.FeeSplit memory fee;
+        if (!genesisDone || (maxShares > 0 && totalShares >= maxShares)) {
+            fee = VaultMath.computeFeeSplit(usdcAmount, depositFeeBps);
+        } else {
+            // Same math as deposit, including the Fixed-vault share-cap clamp.
+            (sharesOut,, fee) = _quoteDeposit(usdcAmount);
+        }
+        return (sharesOut, fee.netAmount, fee.companyFee, fee.managerFee);
     }
 
     function totalNav() external view returns (uint256) {
@@ -737,6 +841,61 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     }
 
     // ── Internal views ────────────────────────────────────────────────────────
+
+    /// @dev Shared by deposit and previewDeposit. Assumes genesis is done and the cap (if
+    ///      any) is not yet full. On the clamp path the gross is scaled down and the fee
+    ///      recomputed from it, so shares are always minted against the real net cash kept.
+    function _quoteDeposit(uint256 usdcAmount)
+        internal
+        view
+        returns (uint256 shares, uint256 grossUsdc, VaultMath.FeeSplit memory fee)
+    {
+        uint256 navAssets = _sumNav();
+        uint256 pendingUsdc = totalPendingUsdc;
+        uint256 totalShares_ = totalShares;
+
+        grossUsdc = usdcAmount;
+        fee = VaultMath.computeFeeSplit(grossUsdc, depositFeeBps);
+        if (fee.netAmount == 0) return (0, grossUsdc, fee);
+        shares = VaultMath.computeSharesToMint(fee.netAmount, totalShares_, navAssets, pendingUsdc);
+
+        if (maxShares > 0 && totalShares_ + shares > maxShares) {
+            uint256 remaining = maxShares - totalShares_;
+            uint256 clampedNet = VaultMath.computeUsdcForShares(remaining, totalShares_, navAssets + pendingUsdc);
+            grossUsdc = (clampedNet * usdcAmount) / fee.netAmount;
+            fee = VaultMath.computeFeeSplit(grossUsdc, depositFeeBps);
+            // net <= clampedNet, so this never exceeds `remaining`.
+            shares = fee.netAmount == 0
+                ? 0
+                : VaultMath.computeSharesToMint(fee.netAmount, totalShares_, navAssets, pendingUsdc);
+        }
+    }
+
+    /// @dev Free (unreserved) balance of slot `i`. For a USDC slot, cash earmarked for
+    ///      pending deployment or owed to redeemers is not free either.
+    function _freeBalance(uint8 i, address usdc) internal view returns (uint256 free, address mint) {
+        (, mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(_assetIds[i]);
+        uint256 bal = ERC20Minimal(mint).balanceOf(address(this));
+        uint256 locked = _reservedAssets[i];
+        if (mint == usdc) locked += totalPendingUsdc + vaultRedeemEscrowTotal;
+        free = bal > locked ? bal - locked : 0;
+    }
+
+    function _value(address mint, uint256 amount, address usdc) internal view returns (uint256) {
+        if (mint == usdc) return amount;
+        return IZenoIndexVault(zenoIndexVault).valueUsdc(mint, amount);
+    }
+
+    function _checkActive() internal view {
+        if (paused) revert VaultPaused();
+        if (adminLocked) revert VaultAdminLocked();
+        if (IZenoIndexVault(zenoIndexVault).isEmergency()) revert EmergencyActive();
+    }
+
+    function _requirePath(address[] calldata path, address start, address end) internal pure {
+        require(path.length >= 2 && path[0] == start, "PATH_START");
+        if (path[path.length - 1] != end) revert PathEnd();
+    }
 
     function _sumNav() internal view returns (uint256) {
         uint8 n = numAssets;

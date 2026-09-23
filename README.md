@@ -83,16 +83,22 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 |---|---|
 | `constructor(usdcToken_, vaultImplementation_, accessMaster_)` | Sets registry state + binds `accessMaster` |
 | `superAdmin` / `isOperator` / `treasury` | → `IAccessMaster(accessMaster)` passthrough views |
-| `setEmergency` | Super-admin config (`onlySuperAdmin` → `AccessMaster`) |
-| `setPrice` / `setPriceWhole` | Sets the per-token USDC price table (`onlySuperAdmin`) |
+| `setEmergency` | Super-admin config (`onlySuperAdmin` → `AccessMaster`). Emergency halts `createVault`, genesis, deposits and every swap (`executeSwap`); `setPrice` and in-kind redeem exits stay open |
+| `setUsdcToken` | `onlySuperAdmin`; reverts `VaultsExist` once any vault has been created |
+| `setPrice` / `setPriceWhole` | Sets the per-token USDC price table (`onlySuperAdmin`). Rejects a zero price and any single move larger than `maxPriceChangeBps`; stamps `priceUpdatedAt` |
+| `setMaxPriceAge` / `setMaxPriceChangeBps` / `setMaxSwapSlippageBps` | `onlySuperAdmin` price-safety knobs (defaults: 1 day, 20%, 3%). Quotes older than `maxPriceAge` revert `StalePrice` |
 | `setSwapRouter` | Sets the `ISwapRouter` address clones swap through (`onlySuperAdmin`) |
+| `setVaultCreator` | `onlySuperAdmin` — allowlists an account that may call `createVault` |
+| `setVaultOperator(vaultId, account, allowed)` | `onlySuperAdmin` — grants manager powers on **one** vault (operators are per vault) |
 | `createAsset` / `setAssetActive` | Asset registry storage (`onlySuperAdminOrOperator` → `AccessMaster`) |
 | `getAsset` | Asset registry read |
 | `valueUsdc` | Values a token amount in USDC 6-decimal units (1:1 for `usdcToken`, price table otherwise) |
 | `sumNav` | Sums a vault clone's free (non-reserved) balances in USDC 6-decimal units |
-| `executeSwap` | → `ISwapRouter(router).swap` — orchestrates a clone's swap without custodying tokens |
-| `createVault` | → `Constants.MAX_ASSETS`; `Clones.clone` (OpenZeppelin); `IVault(clone).init` (`Vault`) |
+| `executeSwap` | Registered clones only (`isVaultClone`), `from == msg.sender`, not during emergency; raises `minAmountOut` to `swapFloor`; → `ISwapRouter(router).swap` |
+| `swapFloor` | Price-table quote of `tokenIn → tokenOut` less `maxSwapSlippageBps` |
+| `createVault` | Super-admin or `isVaultCreator` only; requires `router` set and a price for every non-USDC asset; → `Constants.MAX_ASSETS`; `Clones.clone` (OpenZeppelin); `IVault(clone).init` (`Vault`) |
 | `confirmWriteOff` / `confirmReactivate` | → `IVault(clone).executeWriteOff` / `executeReactivate` |
+| `sweepWrittenOff(vaultId, assetId, to)` | `onlySuperAdmin` → `IVault(clone).executeSweep` — moves a written-off asset's balance out |
 | `setVaultEmergencyLock` | → `Vault(clone).setVaultEmergencyLock` |
 
 Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `router`, `getAsset`, `valueUsdc`, `sumNav`, …).
@@ -106,43 +112,47 @@ Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `router
 | Function | Dependencies / calls |
 |---|---|
 | `init(...)` | → `Constants` fee bounds / BPS; `new ShareToken`; OpenZeppelin `Initializable` |
-| `setPaused` / `setFeeRecipient` | Manager-only control |
+| `setPaused` / `setFeeRecipient` | Manager-only control (`setFeeRecipient` rejects `address(0)`). "Manager" = `vaultManager` or an operator scoped to this vault via `ZenoIndexVault.setVaultOperator` |
 | `setVaultEmergencyLock` | Called only by `ZenoIndexVault` |
 | `assetIdAt` / `allocationBpsAt` / `usdcTargetAmountAt` / `reservedAt` | Slot getters |
-| `genesisDeposit` | → `VaultMath.calculateReverseGenesisShares`; `Constants.GENESIS_SEED_USDC`; `IZenoIndexVault.usdcToken`; `ERC20Minimal.transferFrom`; `ShareToken.mint`; `_recordPendingTargets` |
-| `deposit` | → `_sumNav` → `ZenoIndexVault.sumNav`; `VaultMath.computeSharesToMint` / `computeUsdcForShares` / `computeFeeSplit`; `ERC20Minimal.transferFrom`; `_payFees`; `ShareToken.mint`; `_recordPendingTargets` |
-| `previewDeposit` | → `VaultMath.computeFeeSplit` / `computeSharesToMint`; `_sumNav` |
+| `genesisDeposit` | Halts on pause / admin lock / emergency; → `VaultMath.calculateReverseGenesisShares`; `Constants.GENESIS_SEED_USDC`; `IZenoIndexVault.usdcToken`; `SafeERC20.safeTransferFrom`; `ShareToken.mint`; `_recordPendingTargets` |
+| `deposit` | Halts on pause / admin lock / emergency; → `_quoteDeposit` (`_sumNav`, `VaultMath.computeSharesToMint` / `computeUsdcForShares` / `computeFeeSplit`, share-cap clamp); `SafeERC20.safeTransferFrom`; `_payFees`; `ShareToken.mint`; `_recordPendingTargets(fee.netAmount)` |
+| `previewDeposit` | → `_quoteDeposit` — identical math to `deposit`, including the share-cap clamp |
 | `totalNav` | → `_sumNav` + `totalPendingUsdc` |
-| `requestRedeem` | → `IZenoIndexVault.getAsset`; `ERC20Minimal.balanceOf`; `VaultMath.computeRedeemSwapAmounts` / `computePendingCarve`; `ShareToken.burn` |
+| `requestRedeem` | → `_freeBalance` (a USDC slot excludes pending + escrowed cash); `VaultMath.computeRedeemSwapAmounts` / `computePendingCarve`; `ShareToken.burn`. A USDC slot's share is credited to escrow directly; reverts `ZeroAmount` if every leg rounds to 0 |
 | `getRedeemState` / `getRedeemAssetAmount` | Redeem views |
-| `claim` | → `VaultMath.computeFeeSplit`; `_payFees`; `ERC20Minimal.transfer`; `_resetRedeem` |
-| `swapUsdcToAsset` | → `IZenoIndexVault.getAsset` / `usdcToken` / `router` / `executeSwap`; `ERC20Minimal.approve` |
-| `swapAssetToUsdc` | Same swap path as above for redeem unwind |
+| `claim` | Requires every leg swapped; → `_payOutEscrow` (`VaultMath.computeFeeSplit`, `_payFees`, `SafeERC20`); `_resetRedeem`. A zero escrow still closes the redeem |
+| `claimInKind` | Redeemer closes their redeem without swapping: unswapped legs paid in the asset (redeem fee taken in-kind) + escrowed USDC. Works during pause / lock / emergency |
+| `forceSettleRedeem(user)` | Anyone, after `Constants.REDEEM_TIMEOUT` (7 days): settles `user`'s redeem in-kind to `user` |
+| `swapUsdcToAsset` | Manager; halts on pause / lock / emergency; → `_swap` (`forceApprove` exact amount → `IZenoIndexVault.executeSwap` → reset approval; output measured by balance delta) |
+| `swapAssetToUsdc` | Redeemer's unwind leg; halts on admin lock / emergency; same `_swap` path |
 | `setTargetAllocations` | → `Constants.MAX_ASSETS` / `BPS_DENOM` |
-| `executeRebalance` | → `_sumNav`; `IZenoIndexVault.getAsset` / `usdcToken` / `valueUsdc` / `router` / `executeSwap`; `Constants.REBALANCE_DRIFT_BPS`; may `_retireSlot` |
+| `executeRebalance` | Manager; halts on pause / lock / emergency. Target > 0: trades the delta outside `Constants.REBALANCE_DRIFT_BPS` (`_rebalanceTowardTarget`). Target 0: sells the **whole** free balance, then retires the slot once at most `Constants.RETIRE_DUST_USDC` is left (and no redeem is active) |
 | `proposeWriteOff` / `proposeReactivate` | Manager proposes Path B |
-| `executeWriteOff` / `executeReactivate` | Called by `ZenoIndexVault`; → `IZenoIndexVault.valueUsdc` / `ERC20Minimal` / `_retireSlot` |
+| `executeWriteOff` / `executeReactivate` | Called by `ZenoIndexVault`; → `IZenoIndexVault.valueUsdc` (informational, best-effort) / `ERC20Minimal` / `_retireSlot`. USDC can't be written off |
+| `executeSweep(assetId, to)` | Called by `ZenoIndexVault.sweepWrittenOff`; transfers a written-off asset's balance to `to` |
 
-Internal helpers of note: `_sumNav` → `ZenoIndexVault.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `ERC20Minimal.transfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`.
+Internal helpers of note: `_sumNav` → `ZenoIndexVault.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `SafeERC20.safeTransfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`; `_swap` (exact approve, balance-delta output); `_quoteDeposit`; `_freeBalance`; `_settleInKind`.
 
-Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`; `IZenoIndexVault`, `IVault`, `ISwapRouter`; `ERC20Minimal`, `ShareToken`, `VaultMath`, `Constants`.
+Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`, `IERC20`, `SafeERC20`; `IZenoIndexVault`, `IVault`; `ERC20Minimal`, `ShareToken`, `VaultMath`, `Constants`.
 
 ---
 
 ### `src/AccessMaster.sol`
 
-**What it does:** Singleton role + treasury registry — the sole source of truth for who is admin, who is an operator, and where fees go, across the protocol. Wraps OpenZeppelin `AccessControl` directly — `ADMIN_ROLE` is an explicit alias for `DEFAULT_ADMIN_ROLE`, transferred in **one call** by the current super-admin via `setSuperAdmin` (grants the role to the new admin and revokes it from the caller atomically — no pending step, no acceptance call from the new admin, no delay). `OPERATOR_ROLE` is granted/revoked via named `addOperator` / `removeOperator` wrappers (OZ's own `grantRole` / `revokeRole` remain usable too — these don't disable them). `superAdmin()` / `isOperator()` are read-only aliases over the same OZ state, for the vocabulary `ZenoIndexVault.sol` already reads live via `IAccessMaster`. `ZenoIndexVault` reads roles + treasury live instead of storing them itself.
+**What it does:** Singleton role + treasury registry — the sole source of truth for who is admin, who is an operator, and where fees go, across the protocol. Wraps OpenZeppelin `AccessControl` directly — `ADMIN_ROLE` is an explicit alias for `DEFAULT_ADMIN_ROLE` with exactly one holder, always equal to `superAdmin()`. It moves in **two steps**: the current super-admin proposes via `setSuperAdmin`, and the new admin takes it with `acceptSuperAdmin` (a wrong proposal is fixed by proposing again). OZ's public `grantRole` / `revokeRole` / `renounceRole` revert for `ADMIN_ROLE`, so the role and `superAdmin()` can't drift apart. `OPERATOR_ROLE` is granted/revoked via named `addOperator` / `removeOperator` wrappers (OZ's own `grantRole` / `revokeRole` remain usable for it). A global operator only manages the asset registry — vault manager powers are granted per vault on `ZenoIndexVault`. `superAdmin()` / `isOperator()` are read-only aliases over the same OZ state, for the vocabulary `ZenoIndexVault.sol` already reads live via `IAccessMaster`. `ZenoIndexVault` reads roles + treasury live instead of storing them itself.
 
 | Function | Dependencies / calls |
 |---|---|
 | `constructor(initialSuperAdmin, initialTreasury)` | → OpenZeppelin `AccessControl._grantRole(ADMIN_ROLE, initialSuperAdmin)`; sets `treasury` |
 | `superAdmin` | Read alias over the tracked single `ADMIN_ROLE` holder |
-| `setSuperAdmin` | `onlyRole(ADMIN_ROLE)` — grants the new admin + revokes the caller in one call |
+| `setSuperAdmin` | `onlyRole(ADMIN_ROLE)` — proposes `pendingSuperAdmin` |
+| `acceptSuperAdmin` | `pendingSuperAdmin` only — revokes the old admin, grants the caller, updates `superAdmin()` |
 | `isOperator` | → `hasRole(OPERATOR_ROLE, account)` (read alias) |
 | `addOperator` / `removeOperator` | `onlyRole(ADMIN_ROLE)` — `_grantRole` / `_revokeRole(OPERATOR_ROLE, account)` |
 | `treasury` | Public state, set at construction |
 | `setTreasury` | `onlyRole(ADMIN_ROLE)` |
-| *(inherited)* `grantRole` / `revokeRole(OPERATOR_ROLE, account)` | OZ `AccessControl`, admin-role-gated — still usable directly |
+| `grantRole` / `revokeRole` / `renounceRole` | OZ `AccessControl` overrides — revert `AdminRoleManagedBySetSuperAdmin` for `ADMIN_ROLE`, otherwise unchanged |
 
 Implements `IAccessMaster`.
 
@@ -150,15 +160,17 @@ Implements `IAccessMaster`.
 
 ### `src/adapters/UniswapV4Adapter.sol`
 
-**What it does:** Production `ISwapRouter` adapter that chains exact-input hops through a Uniswap V4 `PoolManager` using admin-registered per-pair pools.
+**What it does:** Production `ISwapRouter` adapter that chains exact-input hops through a Uniswap V4 `PoolManager` using admin-registered per-pair pools. `swap` pulls from an arbitrary `from`, so only admin-authorized callers (the `ZenoIndexVault` factory) may call it.
 
 | Function | Dependencies / calls |
 |---|---|
 | `constructor(poolManager_, admin_)` | → `v4-core` `IPoolManager` |
 | `setAdmin` | Admin rotation |
-| `setPool` | Registers `PoolKey` (`Currency`, `IHooks`, fee, tickSpacing) |
-| `swap` | → `ERC20Minimal.transferFrom`; `poolManager.unlock` |
-| `unlockCallback` | → `poolManager.swap` / `sync` / `settle` / `take`; `ERC20Minimal.transfer`; `TickMath`, `BalanceDelta` (v4-core) |
+| `setAuthorizedCaller` | Admin — allowlists a contract that may call `swap` (authorize `ZenoIndexVault` after deploy) |
+| `setHookAllowed` | Admin — allowlists a V4 hook contract |
+| `setPool` | Registers `PoolKey` (`Currency`, `IHooks`, fee, tickSpacing); `hooks` must be `address(0)` or allowlisted |
+| `swap` | Authorized callers only; → `SafeERC20.safeTransferFrom`; `poolManager.unlock` |
+| `unlockCallback` | → `poolManager.swap` / `sync` / `settle` / `take`; `SafeERC20.safeTransfer`; `TickMath`, `BalanceDelta` (v4-core) |
 
 ---
 
@@ -226,7 +238,7 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 | Function | Dependencies / calls |
 |---|---|
-| `superAdmin` / `treasury` / `usdcToken` / `isEmergency` / `router` / `isOperator` / `getAsset` / `valueUsdc` / `sumNav` / `executeSwap` | Interface only — implemented by `ZenoIndexVault` |
+| `superAdmin` / `treasury` / `usdcToken` / `isEmergency` / `router` / `isOperator` / `isVaultOperator` / `getAsset` / `valueUsdc` / `sumNav` / `executeSwap` | Interface only — implemented by `ZenoIndexVault` |
 
 ---
 
@@ -236,7 +248,7 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 | Function | Dependencies / calls |
 |---|---|
-| `init` / `executeWriteOff` / `executeReactivate` | Interface only — implemented by `Vault` |
+| `init` / `executeWriteOff` / `executeReactivate` / `executeSweep` | Interface only — implemented by `Vault` |
 
 ---
 

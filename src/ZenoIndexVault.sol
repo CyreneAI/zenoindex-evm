@@ -62,9 +62,27 @@ contract ZenoIndexVault is IZenoIndexVault {
     mapping(uint64 => AssetInfo) internal _assets;
     mapping(address => bool) internal _mintRegistered;
 
+    // ── Price safety rails ───────────────────────────────────────────────────
+    /// @dev Last `setPrice`/`setPriceWhole` timestamp per token.
+    mapping(address => uint256) public priceUpdatedAt;
+    /// @notice A price older than this reverts every quote (StalePrice). 0 disables.
+    uint256 public maxPriceAge = 1 days;
+    /// @notice Max move of one price update vs the previous price, in bps. 0 disables.
+    uint16 public maxPriceChangeBps = 2_000;
+    /// @notice Swap floor: every swap's minAmountOut is raised to at least the price-table
+    ///         quote minus this many bps. 10_000 disables the floor.
+    uint16 public maxSwapSlippageBps = 300;
+
     // ── Vault (clone) registry ────────────────────────────────────────────────
     uint64 public totalVaults;
     mapping(uint64 => address) public vaultClones;
+    mapping(address => bool) public isVaultClone;
+
+    // ── Vault creation + per-vault operators ─────────────────────────────────
+    /// @notice Accounts super-admin allows to call `createVault` (super-admin always can).
+    mapping(address => bool) public isVaultCreator;
+    /// @notice vault clone => account => may act as that vault's manager.
+    mapping(address => mapping(address => bool)) public isVaultOperator;
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
     modifier onlySuperAdmin() {
@@ -98,6 +116,12 @@ contract ZenoIndexVault is IZenoIndexVault {
     );
     event WriteOffConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
     event ReactivateConfirmed(uint64 indexed vaultId, uint64 indexed assetId);
+    event WrittenOffSwept(uint64 indexed vaultId, uint64 indexed assetId, address to);
+    event VaultCreatorSet(address indexed account, bool allowed);
+    event VaultOperatorSet(uint64 indexed vaultId, address indexed account, bool allowed);
+    event MaxPriceAgeSet(uint256 maxPriceAge);
+    event MaxPriceChangeBpsSet(uint16 maxPriceChangeBps);
+    event MaxSwapSlippageBpsSet(uint16 maxSwapSlippageBps);
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error NotSuperAdmin();
@@ -112,6 +136,15 @@ contract ZenoIndexVault is IZenoIndexVault {
     error DuplicateMint();
     error NoPrice();
     error NoRouter();
+    error NotVaultCreator();
+    error NotVaultClone();
+    error InvalidSwapSource();
+    error Emergency();
+    error ZeroPrice();
+    error StalePrice(address token);
+    error PriceChangeTooLarge(address token);
+    error VaultsExist();
+    error InvalidBps();
 
     // ── Constructor ───────────────────────────────────────────────────────────
     constructor(address usdcToken_, address vaultImplementation_, address accessMaster_) {
@@ -136,30 +169,43 @@ contract ZenoIndexVault is IZenoIndexVault {
     /// @dev Every existing vault clone's deposit/redeem/fee accounting and NAV math treats
     ///      `usdcToken` as a fixed 1:1 peg read live from here — changing it after any vault
     ///      has live balances desyncs that accounting (old balances are still in the old
-    ///      token). Safe only before `createVault` is ever called, or with full awareness
-    ///      of that consequence.
+    ///      token), so it reverts once any vault exists.
     function setUsdcToken(address newUsdcToken) external onlySuperAdmin {
         if (newUsdcToken == address(0)) revert ZeroAddress();
+        if (totalVaults > 0) revert VaultsExist();
         emit UsdcTokenSet(usdcToken, newUsdcToken);
         usdcToken = newUsdcToken;
     }
 
     /// @notice Sets raw price: `usdcOut` USDC (6 dec) for `tokenIn` raw token units.
+    /// @dev Stays callable during emergency so a bad price can be corrected while
+    ///      everything that moves value is frozen.
     function setPrice(address token, uint256 usdcOut, uint256 tokenIn) external onlySuperAdmin {
-        if (token == address(0) || tokenIn == 0) revert ZeroAddress();
-        priceNum[token] = usdcOut;
-        priceDen[token] = tokenIn;
-        emit PriceSet(token, usdcOut, tokenIn);
+        if (token == address(0)) revert ZeroAddress();
+        _setPrice(token, usdcOut, tokenIn);
     }
 
     /// @dev Convenience: USD price for 1 whole token (accounts for decimals).
     ///      e.g. token 6 dec at $2 → setPriceWhole(token, 2_000_000)
     function setPriceWhole(address token, uint256 usdcPerWholeToken) external onlySuperAdmin {
         if (token == address(0)) revert ZeroAddress();
-        uint8 dec = ERC20Minimal(token).decimals();
-        priceNum[token] = usdcPerWholeToken;
-        priceDen[token] = 10 ** uint256(dec);
-        emit PriceSet(token, usdcPerWholeToken, 10 ** uint256(dec));
+        _setPrice(token, usdcPerWholeToken, 10 ** uint256(ERC20Minimal(token).decimals()));
+    }
+
+    function setMaxPriceAge(uint256 maxPriceAge_) external onlySuperAdmin {
+        maxPriceAge = maxPriceAge_;
+        emit MaxPriceAgeSet(maxPriceAge_);
+    }
+
+    function setMaxPriceChangeBps(uint16 maxPriceChangeBps_) external onlySuperAdmin {
+        maxPriceChangeBps = maxPriceChangeBps_;
+        emit MaxPriceChangeBpsSet(maxPriceChangeBps_);
+    }
+
+    function setMaxSwapSlippageBps(uint16 maxSwapSlippageBps_) external onlySuperAdmin {
+        if (maxSwapSlippageBps_ > Constants.BPS_DENOM) revert InvalidBps();
+        maxSwapSlippageBps = maxSwapSlippageBps_;
+        emit MaxSwapSlippageBpsSet(maxSwapSlippageBps_);
     }
 
     /// @notice Sets the DEX-execution router address that clones swap through day to day.
@@ -170,9 +216,34 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // External/public setters — vault creators + per-vault operators
+    // ══════════════════════════════════════════════════════════════════════════
+
+    function setVaultCreator(address account, bool allowed) external onlySuperAdmin {
+        if (account == address(0)) revert ZeroAddress();
+        isVaultCreator[account] = allowed;
+        emit VaultCreatorSet(account, allowed);
+    }
+
+    /// @notice Grants/revokes manager powers on ONE vault. Operators are scoped per vault so
+    ///         a leaked operator key cannot touch every vault in the protocol.
+    function setVaultOperator(uint64 vaultId, address account, bool allowed) external onlySuperAdmin {
+        address clone = vaultClones[vaultId];
+        if (clone == address(0)) revert VaultNotFound();
+        if (account == address(0)) revert ZeroAddress();
+        isVaultOperator[clone][account] = allowed;
+        emit VaultOperatorSet(vaultId, account, allowed);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // External/public setters — asset registry
     // ══════════════════════════════════════════════════════════════════════════
 
+    /// @notice Registers an asset. Fee-on-transfer and rebasing tokens are NOT supported
+    ///         and must not be registered: redeem reservations and NAV assume 1:1 transfers
+    ///         and stable balances. (Vault swaps measure output by balance delta and a
+    ///         fee-on-transfer input makes the router's payment revert, so such a token fails
+    ///         loudly rather than silently mis-accounting — but it would still be unusable.)
     function createAsset(
         address mint
     ) external onlySuperAdminOrOperator returns (uint64 assetId) {
@@ -206,10 +277,17 @@ contract ZenoIndexVault is IZenoIndexVault {
     // External/public setters — ETF factory
     // ══════════════════════════════════════════════════════════════════════════
 
+    /// @notice Super-admin or an allowlisted vault creator only — so every entry in
+    ///         `vaultClones` is an official vault. The router and a price for every
+    ///         non-USDC asset must already be set.
     function createVault(
         CreateVaultParams calldata params
     ) external returns (uint64 vaultId) {
-        if (isEmergency) revert("EMERGENCY");
+        if (isEmergency) revert Emergency();
+        if (msg.sender != IAccessMaster(accessMaster).superAdmin() && !isVaultCreator[msg.sender]) {
+            revert NotVaultCreator();
+        }
+        if (router == address(0)) revert NoRouter();
 
         uint256 n = params.assetIds.length;
         if (n == 0) revert NoAssets();
@@ -219,6 +297,7 @@ contract ZenoIndexVault is IZenoIndexVault {
             AssetInfo storage a = _assets[params.assetIds[i]];
             if (!a.exists) revert AssetMissing();
             if (!a.active) revert AssetInactive();
+            if (a.mint != usdcToken && priceDen[a.mint] == 0) revert NoPrice();
             for (uint256 j = i + 1; j < n; j++) {
                 if (params.assetIds[j] == params.assetIds[i])
                     revert AlreadyExists();
@@ -228,6 +307,7 @@ contract ZenoIndexVault is IZenoIndexVault {
         vaultId = totalVaults;
         address clone = Clones.clone(vaultImplementation);
         vaultClones[vaultId] = clone;
+        isVaultClone[clone] = true;
         totalVaults = vaultId + 1;
 
         IVault(clone).init(
@@ -273,6 +353,15 @@ contract ZenoIndexVault is IZenoIndexVault {
         emit ReactivateConfirmed(vaultId, assetId);
     }
 
+    /// @notice Moves a written-off asset's whole balance out of the vault to `to`.
+    function sweepWrittenOff(uint64 vaultId, uint64 assetId, address to) external onlySuperAdmin {
+        address clone = vaultClones[vaultId];
+        if (clone == address(0)) revert VaultNotFound();
+        if (to == address(0)) revert ZeroAddress();
+        IVault(clone).executeSweep(assetId, to);
+        emit WrittenOffSwept(vaultId, assetId, to);
+    }
+
     function setVaultEmergencyLock(
         uint64 vaultId,
         bool locked
@@ -287,15 +376,40 @@ contract ZenoIndexVault is IZenoIndexVault {
     // ══════════════════════════════════════════════════════════════════════════
 
     /// @notice Executes a swap along `path` through the currently-registered router.
+    ///         Only registered vault clones may call, only for their own tokens, and never
+    ///         during emergency. `minAmountOut` is raised to the price-table floor.
     /// @dev `from` (the calling Vault.sol clone) must have approved `router` directly —
     ///      this contract never custodies the tokens, it only orchestrates the call.
     function executeSwap(address[] calldata path, uint256 amountIn, uint256 minAmountOut, address from, address to)
         external
         returns (uint256 amountOut)
     {
+        if (!isVaultClone[msg.sender]) revert NotVaultClone();
+        if (from != msg.sender) revert InvalidSwapSource();
+        if (isEmergency) revert Emergency();
         address r = router;
         if (r == address(0)) revert NoRouter();
+        uint256 floor = swapFloor(path[0], path[path.length - 1], amountIn);
+        if (floor > minAmountOut) minAmountOut = floor;
         amountOut = ISwapRouter(r).swap(path, amountIn, minAmountOut, from, to);
+    }
+
+    /// @notice Minimum acceptable output for swapping `amountIn` of `tokenIn` to `tokenOut`:
+    ///         the price-table quote less `maxSwapSlippageBps`.
+    function swapFloor(address tokenIn, address tokenOut, uint256 amountIn) public view returns (uint256) {
+        uint256 slip = maxSwapSlippageBps;
+        if (slip >= Constants.BPS_DENOM) return 0;
+        uint256 usdcValue = tokenIn == usdcToken ? amountIn : _quote(tokenIn, amountIn);
+        uint256 expectedOut;
+        if (tokenOut == usdcToken) {
+            expectedOut = usdcValue;
+        } else {
+            _checkFresh(tokenOut);
+            uint256 num = priceNum[tokenOut];
+            if (num == 0) revert NoPrice();
+            expectedOut = (usdcValue * priceDen[tokenOut]) / num;
+        }
+        return (expectedOut * (Constants.BPS_DENOM - slip)) / Constants.BPS_DENOM;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -372,6 +486,30 @@ contract ZenoIndexVault is IZenoIndexVault {
     function _quote(address token, uint256 amount) internal view returns (uint256) {
         uint256 den = priceDen[token];
         if (den == 0) revert NoPrice();
+        _checkFresh(token);
         return (amount * priceNum[token]) / den;
+    }
+
+    function _checkFresh(address token) internal view {
+        uint256 age = maxPriceAge;
+        if (age != 0 && block.timestamp > priceUpdatedAt[token] + age) revert StalePrice(token);
+    }
+
+    function _setPrice(address token, uint256 usdcOut, uint256 tokenIn) internal {
+        if (usdcOut == 0 || tokenIn == 0) revert ZeroPrice();
+        uint256 oldNum = priceNum[token];
+        uint256 oldDen = priceDen[token];
+        uint256 bound = maxPriceChangeBps;
+        if (bound != 0 && oldDen != 0) {
+            // Compare per-unit prices by cross-multiplying: new = usdcOut/tokenIn, old = oldNum/oldDen.
+            uint256 newScaled = usdcOut * oldDen;
+            uint256 oldScaled = oldNum * tokenIn;
+            uint256 diff = newScaled > oldScaled ? newScaled - oldScaled : oldScaled - newScaled;
+            if (diff * Constants.BPS_DENOM > oldScaled * bound) revert PriceChangeTooLarge(token);
+        }
+        priceNum[token] = usdcOut;
+        priceDen[token] = tokenIn;
+        priceUpdatedAt[token] = block.timestamp;
+        emit PriceSet(token, usdcOut, tokenIn);
     }
 }
