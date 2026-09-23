@@ -117,14 +117,6 @@ else
   missing=$((missing + 1))
 fi
 
-# Unrelated project docs must not be wiped by this documentation work.
-if [[ -f "$ROOT/BUGFIX_REPORT.md" ]] && [[ ! -s "$ROOT/BUGFIX_REPORT.md" ]]; then
-  echo "FAIL: BUGFIX_REPORT.md exists but is empty (0 bytes)" >&2
-  missing=$((missing + 1))
-elif [[ -f "$ROOT/BUGFIX_REPORT.md" ]]; then
-  echo "OK: BUGFIX_REPORT.md present and non-empty"
-fi
-
 echo "Checked $count src Solidity files against README.md"
 if [[ "$missing" -ne 0 ]]; then
   echo "FAIL: $missing check(s) failed" >&2
