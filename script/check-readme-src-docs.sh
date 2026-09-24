@@ -32,7 +32,7 @@ else
 fi
 
 # Core modules must have a purpose sentence and a function table header nearby.
-for core in ZenoIndexVault Vault NavCalculation SwapExecutor AccessMaster VaultMath UniswapV4Adapter; do
+for core in ZenoIndexVault Vault AccessMaster VaultMath UniswapV4Adapter; do
   if ! grep -Eq "### .*${core}\\.sol" "$README"; then
     echo "FAIL: missing section heading for ${core}.sol" >&2
     missing=$((missing + 1))
@@ -72,29 +72,14 @@ section_has() {
   return 0
 }
 
-if ! section_has NavCalculation "IZenoIndexVault.usdcToken" "getAsset" "ERC20Minimal.balanceOf" "IPriceOracle.quoteUsdc" "USDC legs valued 1:1"; then
-  missing=$((missing + 1))
-elif grep -Fq "non-USDC legs valued 1:1" "$README"; then
-  echo "FAIL: NavCalculation.sumNav callout still inverts USDC vs non-USDC valuation" >&2
-  missing=$((missing + 1))
-else
-  echo "OK: NavCalculation.sumNav deps match src (USDC 1:1, non-USDC via quoteUsdc)"
-fi
-
-if section_has ZenoIndexVault "Clones.clone" "IVault(clone).init" "ISwapModAdmin" "Constants.MAX_ASSETS"; then
-  echo "OK: ZenoIndexVault deps match createVault/setSwapRouter path"
+if section_has ZenoIndexVault "Clones.clone" "IVault(clone).init" "Constants.MAX_ASSETS" "ISwapRouter(router).swap"; then
+  echo "OK: ZenoIndexVault deps match createVault / executeSwap path"
 else
   missing=$((missing + 1))
 fi
 
-if section_has Vault "VaultMath.computeSharesToMint" "ShareToken.mint" "NavCalculation.sumNav" "ISwapExecutorLike.executeSwap" "ReentrancyGuard"; then
+if section_has Vault "VaultMath.computeSharesToMint" "ShareToken.mint" "ZenoIndexVault.sumNav" "IZenoIndexVault.executeSwap" "ReentrancyGuard"; then
   echo "OK: Vault deps match deposit/NAV/swap path"
-else
-  missing=$((missing + 1))
-fi
-
-if section_has SwapExecutor "ISwapRouter(router).swap"; then
-  echo "OK: SwapExecutor deps match executeSwap → ISwapRouter"
 else
   missing=$((missing + 1))
 fi

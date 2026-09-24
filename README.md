@@ -1,6 +1,6 @@
 # zenoindex-evm
 
-EVM smart contracts for Zeno Index: a clone-factory index vault that deposits a stablecoin (USDC or USDG), deploys into registered assets via a swap module, prices NAV through an oracle, and supports redeem / rebalance / write-off flows.
+EVM smart contracts for Zeno Index: a clone-factory index vault that deposits a stablecoin (USDC or USDG), deploys into registered assets through Uniswap V4, values NAV from an admin-pushed price table, and supports redeem / rebalance / write-off flows.
 
 ## Architecture overview
 
@@ -63,11 +63,9 @@ flowchart TB
 
 Production call path (simplified):
 
-`ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `ZenoIndexVault.sumNav` + `ZenoIndexVault.executeSwap` → `ISwapRouter` (`UniswapV4Adapter` or mock).
+Allowlisted `ZenoIndexVault.createVault` → `Vault.init` → `ShareToken` → user `deposit` / `requestRedeem` → `ZenoIndexVault.sumNav` + `ZenoIndexVault.executeSwap` → `UniswapV4Adapter`.
 
-NAV/valuation (formerly `NavCalculation.sol`) and swap execution (formerly `SwapExecutor.sol`) are no longer separate singleton contracts — both now live inside `ZenoIndexVault.sol` itself, so every `Vault.sol` clone has exactly one external module address to call back into.
-
-Roles and treasury are set once at `ZenoIndexVault`'s construction (an `AccessMaster` address) and read live via `IAccessMaster` on every permission check — `ZenoIndexVault` itself holds no admin/operator/treasury storage.
+NAV, prices, and swap execution live on `ZenoIndexVault`. Roles and treasury live on `AccessMaster` and are read live via `IAccessMaster`. Every production vault should include a USDC basket slot so rebalance cash stays in NAV — see [docs/MAINNET_REVIEW.md](docs/MAINNET_REVIEW.md).
 
 ---
 
@@ -77,7 +75,7 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 
 ### `src/ZenoIndexVault.sol`
 
-**What it does:** Root factory and registry — emergency flag, asset registry, NAV/valuation (formerly `NavCalculation.sol`), swap execution (formerly `SwapExecutor.sol`), ERC-1167 vault cloning, and Path B write-off / reactivate relays. Holds no admin/operator/treasury storage of its own — `superAdmin` / `isOperator` / `treasury` are read live from `AccessMaster` (set once at construction) via `IAccessMaster`.
+**What it does:** Root factory and registry — emergency flag, asset registry, admin price table, swap execution, ERC-1167 vault cloning, and Path B write-off / reactivate / sweep relays. Holds no admin/operator/treasury storage of its own — `superAdmin` / `isOperator` / `treasury` are read live from `AccessMaster` (set once at construction) via `IAccessMaster`.
 
 | Function | Dependencies / calls |
 |---|---|
@@ -93,7 +91,7 @@ For each Solidity file: **what it does**, then **public/external (or library) fu
 | `createAsset` / `setAssetActive` | Asset registry storage (`onlySuperAdminOrOperator` → `AccessMaster`) |
 | `getAsset` | Asset registry read |
 | `valueUsdc` | Values a token amount in USDC 6-decimal units (1:1 for `usdcToken`, price table otherwise) |
-| `sumNav` | Sums a vault clone's free (non-reserved) balances in USDC 6-decimal units |
+| `sumNav` | Sums a vault clone's free (non-reserved) balances in USDC 6-decimal units. USDC legs valued 1:1; non-USDC via the price table. Counts a USDC slot's `ERC20Minimal.balanceOf` after subtracting pending + escrow |
 | `executeSwap` | Registered clones only (`isVaultClone`), `from == msg.sender`, not during emergency; raises `minAmountOut` to `swapFloor`; → `ISwapRouter(router).swap` |
 | `swapFloor` | Price-table quote of `tokenIn → tokenOut` less `maxSwapSlippageBps` |
 | `createVault` | Super-admin or `isVaultCreator` only; requires `router` set and a price for every non-USDC asset; → `Constants.MAX_ASSETS`; `Clones.clone` (OpenZeppelin); `IVault(clone).init` (`Vault`) |
@@ -134,7 +132,7 @@ Also implements `IZenoIndexVault` view surface (`usdcToken`, `treasury`, `router
 
 Internal helpers of note: `_sumNav` → `ZenoIndexVault.sumNav`; `_payFees` → `IZenoIndexVault.treasury` + `SafeERC20.safeTransfer`; `_recordPendingTargets` → `VaultMath.allocationSlice`; `_swap` (exact approve, balance-delta output); `_quoteDeposit`; `_freeBalance`; `_settleInKind`.
 
-Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`, `IERC20`, `SafeERC20`; `IZenoIndexVault`, `IVault`; `ERC20Minimal`, `ShareToken`, `VaultMath`, `Constants`.
+Imports: OpenZeppelin `Initializable`, `ReentrancyGuard`, `IERC20`, `SafeERC20`; `IZenoIndexVault`, `IVault`; `ERC20Minimal`, `ShareToken`, `VaultMath`, `Constants`. Deposit path: `VaultMath.computeSharesToMint` → `ShareToken.mint` → `_sumNav` → `ZenoIndexVault.sumNav` → `IZenoIndexVault.executeSwap`.
 
 ---
 
@@ -194,9 +192,9 @@ Implements `IAccessMaster`.
 
 ### `src/libraries/Constants.sol`
 
-**What it does:** Protocol-wide constants (asset cap, price scale, genesis seed, fee bounds, company fee share, rebalance drift band). No functions — only `internal constant` values consumed by `Vault`, `ZenoIndexVault`, and `VaultMath`.
+**What it does:** Protocol-wide constants (asset cap, price scale, genesis seed, fee bounds, company fee share, rebalance drift band, retire dust, redeem timeout). No functions — only `internal constant` values consumed by `Vault`, `ZenoIndexVault`, and `VaultMath`.
 
-Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE_SHARE_PRICE`, `MAX_DEPOSIT_FEE_BPS`, `MIN/MAX_REDEEM_FEE_BPS`, `COMPANY_FEE_SHARE_BPS`, `BPS_DENOM`, `REBALANCE_DRIFT_BPS`.
+Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE_SHARE_PRICE`, `MAX_DEPOSIT_FEE_BPS`, `MIN/MAX_REDEEM_FEE_BPS`, `COMPANY_FEE_SHARE_BPS`, `BPS_DENOM`, `REBALANCE_DRIFT_BPS`, `RETIRE_DUST_USDC`, `REDEEM_TIMEOUT`.
 
 ---
 
@@ -234,7 +232,7 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 ### `src/interfaces/IZenoIndexVault.sol`
 
-**What it does:** Read/call surface vault clones use to reach the root factory (treasury, USDC/USDG token, modules, oracle, asset registry, roles).
+**What it does:** Read/call surface vault clones use to reach the root factory (treasury, USDC/USDG token, router, price table, asset registry, roles).
 
 | Function | Dependencies / calls |
 |---|---|
@@ -249,16 +247,6 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 | Function | Dependencies / calls |
 |---|---|
 | `init` / `executeWriteOff` / `executeReactivate` / `executeSweep` | Interface only — implemented by `Vault` |
-
----
-
-### `src/interfaces/IPriceOracle.sol`
-
-**What it does:** Injectable price adapter (`quoteUsdc`) returning USDC 6-decimal value.
-
-| Function | Dependencies / calls |
-|---|---|
-| `quoteUsdc(token, amount)` | Implemented by `MockPriceOracle` (tests) or a production oracle |
 
 ---
 
@@ -282,17 +270,6 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 ---
 
-### `src/mocks/MockPriceOracle.sol`
-
-**What it does:** Test `IPriceOracle` with manually set numerators/denominators.
-
-| Function | Dependencies / calls |
-|---|---|
-| `setPrice` / `setPriceWhole` | Local price tables; `setPriceWhole` → `ERC20Minimal.decimals` |
-| `quoteUsdc` | Implements `IPriceOracle` |
-
----
-
 ### `src/mocks/MockSwapRouter.sol`
 
 **What it does:** Test `ISwapRouter` with fixed per-pair rates along a hop path.
@@ -306,7 +283,8 @@ Key symbols: `MAX_ASSETS`, `PRICE_SCALE`, `GENESIS_SEED_USDC`, `MIN/MAX_BASELINE
 
 ## Documentation
 
-https://book.getfoundry.sh/
+- [docs/MAINNET_REVIEW.md](docs/MAINNET_REVIEW.md) — go-ahead, bugs fixed, remaining audit findings, coverage
+- [Foundry book](https://book.getfoundry.sh/)
 
 ## Usage
 
@@ -346,7 +324,7 @@ $ anvil
 $ forge script script/Deploy.s.sol:Deploy --rpc-url $RH_RPC_URL --broadcast --chain-id 46630 -vvvv
 ```
 
-Required env: `PRIVATE_KEY`, `STABLECOIN` (USDC or USDG address). See `script/Deploy.s.sol` and `.env.example`.
+Required env: `PRIVATE_KEY`, `STABLECOIN` (USDC or USDG address). After broadcast, authorize the adapter, set the router and prices, allow vault creators, then create vaults **with a USDC basket slot**. See `script/Deploy.s.sol`, `.env.example`, and [docs/MAINNET_REVIEW.md](docs/MAINNET_REVIEW.md).
 
 ### Cast
 
