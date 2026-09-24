@@ -19,7 +19,6 @@ pids
 lib-cov
 
 # Coverage directory used by tools like istanbul
-coverage
 *.lcov
 
 # nyc test coverage
@@ -153,9 +152,6 @@ out/
 !/broadcast
 /broadcast/*/31337/
 /broadcast/**/dry-run/
-
-# Docs
-docs/
 
 # Dotenv file
 .env
