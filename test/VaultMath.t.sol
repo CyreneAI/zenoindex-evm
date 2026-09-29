@@ -40,6 +40,19 @@ contract VaultMathTest is Test {
         assertEq(s.netAmount, 1);
     }
 
+    function testFuzz_ComputeFeeSplit_PreservesGrossAmount(uint256 grossAmount, uint16 feeBps) public pure {
+        grossAmount = bound(grossAmount, 0, type(uint256).max / Constants.BPS_DENOM);
+
+        feeBps = uint16(bound(feeBps, 0, Constants.BPS_DENOM));
+
+        VaultMath.FeeSplit memory s = VaultMath.computeFeeSplit(grossAmount, feeBps);
+
+        uint256 feeAmount = (grossAmount * uint256(feeBps)) / Constants.BPS_DENOM;
+
+        assertEq(s.companyFee + s.managerFee, feeAmount);
+        assertEq(s.netAmount + feeAmount, grossAmount);
+    }
+
     function test_CalculateReverseGenesisShares_SeedTimesPriceScaleDivBaseline() public pure {
         uint256 baseline = 5_000_000_000;
         uint256 shares = VaultMath.calculateReverseGenesisShares(Constants.GENESIS_SEED_USDC, baseline);
@@ -100,6 +113,30 @@ contract VaultMathTest is Test {
         this.computeSharesToMintExternal(100, 200, 0, 0);
     }
 
+    function testFuzz_ComputeSharesToMint_IsBoundedByScaledDeposit(
+        uint256 usdcDeposit,
+        uint256 totalShares,
+        uint256 totalNav,
+        uint256 pendingUsdc
+    ) public pure {
+        totalShares = bound(totalShares, 1, type(uint256).max);
+
+        totalNav = bound(totalNav, 0, type(uint256).max);
+        pendingUsdc = bound(pendingUsdc, 0, type(uint256).max - totalNav);
+
+        if (totalNav == 0 && pendingUsdc == 0) {
+            pendingUsdc = 1;
+        }
+
+        uint256 nav = totalNav + pendingUsdc;
+
+        usdcDeposit = bound(usdcDeposit, 0, type(uint256).max / totalShares);
+
+        uint256 result = VaultMath.computeSharesToMint(usdcDeposit, totalShares, totalNav, pendingUsdc);
+
+        assertLe(result * nav, usdcDeposit * totalShares);
+    }
+
     function computeSharesToMintExternal(
         uint256 usdcDeposit,
         uint256 totalShares,
@@ -111,7 +148,6 @@ contract VaultMathTest is Test {
 
     function test_ComputeUsdcForShares_BasicCalculation() public pure {
         uint256 usdc = VaultMath.computeUsdcForShares(25, 100, 1_000);
-
         assertEq(usdc, 250);
     }
 
@@ -119,6 +155,25 @@ contract VaultMathTest is Test {
         vm.expectRevert(VaultMath.ZeroAmount.selector);
 
         this.computeUsdcForSharesExternal(25, 0, 1_000);
+    }
+
+    function testFuzz_ComputeUsdcForShares_IsBoundedByNav(
+        uint256 shares,
+        uint256 totalShares,
+        uint256 totalNavIncludingPending
+    ) public pure {
+        totalShares = bound(totalShares, 1, type(uint256).max);
+        shares = bound(shares, 0, totalShares);
+
+        if (shares == 0) {
+            totalNavIncludingPending = bound(totalNavIncludingPending, 0, type(uint256).max);
+        } else {
+            totalNavIncludingPending = bound(totalNavIncludingPending, 0, type(uint256).max / shares);
+        }
+
+        uint256 result = VaultMath.computeUsdcForShares(shares, totalShares, totalNavIncludingPending);
+
+        assertLe(result, totalNavIncludingPending);
     }
 
     function computeUsdcForSharesExternal(uint256 shares, uint256 totalShares, uint256 totalNavIncludingPending)
@@ -137,6 +192,16 @@ contract VaultMathTest is Test {
         assertEq(VaultMath.computeSharePrice(1_000, 100), 10 * Constants.PRICE_SCALE);
     }
 
+    function testFuzz_ComputeSharePrice_IsBoundedByScaledValue(uint256 usdcValue, uint256 totalShares) public pure {
+        totalShares = bound(totalShares, 1, type(uint256).max);
+
+        usdcValue = bound(usdcValue, 0, type(uint256).max / Constants.PRICE_SCALE);
+
+        uint256 result = VaultMath.computeSharePrice(usdcValue, totalShares);
+
+        assertLe(result * totalShares, usdcValue * Constants.PRICE_SCALE);
+    }
+
     function test_ProRataAmount_BasicCalculation() public pure {
         assertEq(VaultMath.proRataAmount(1_000, 25, 100), 250);
     }
@@ -145,6 +210,19 @@ contract VaultMathTest is Test {
         vm.expectRevert(VaultMath.ZeroAmount.selector);
 
         this.proRataAmountExternal(1_000, 25, 0);
+    }
+
+    function testFuzz_ProRataAmount_IsBoundedByBalance(uint256 balance, uint256 shares, uint256 totalShares)
+        public
+        pure
+    {
+        totalShares = bound(totalShares, 1, type(uint256).max);
+        shares = bound(shares, 0, totalShares);
+        balance = bound(balance, 0, type(uint256).max / totalShares);
+
+        uint256 result = VaultMath.proRataAmount(balance, shares, totalShares);
+
+        assertLe(result, balance);
     }
 
     function proRataAmountExternal(uint256 balance, uint256 shares, uint256 totalShares)
@@ -311,6 +389,16 @@ contract VaultMathTest is Test {
 
     function test_AllocationSlice_ZeroBps() public pure {
         assertEq(VaultMath.allocationSlice(100_000_000, 0), 0);
+    }
+
+    function testFuzz_AllocationSlice_IsBoundedByAmount(uint256 amount, uint16 bps) public pure {
+        bps = uint16(bound(bps, 0, Constants.BPS_DENOM));
+
+        amount = bound(amount, 0, type(uint256).max / uint256(Constants.BPS_DENOM));
+
+        uint256 result = VaultMath.allocationSlice(amount, bps);
+
+        assertLe(result, amount);
     }
 
     function test_AllocationSlice_FullBps() public pure {
