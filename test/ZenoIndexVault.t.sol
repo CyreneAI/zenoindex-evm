@@ -1379,6 +1379,88 @@ contract ZenoIndexVaultTest is Test {
         vm.stopPrank();
     }
 
+    function test_RequestRedeem_MultipleRedemptionsRespectReservedAssets()
+        public
+{
+    Vault v = _createDirectVault(0, 50, 0);
+    _genesis(v, 1_000_000_000);
+
+    address user2 = address(0xE55);
+
+    // Give both users shares.
+    _depositAs(v, user, 100e6);
+    _depositAs(v, user2, 100e6);
+
+    // Deploy the vault's USDC into Token A so redemptions have an asset
+    // balance to reserve.
+    vm.startPrank(manager);
+    v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+    vm.stopPrank();
+
+    uint256 totalAssetBalance = tokenA.balanceOf(address(v));
+    assertGt(totalAssetBalance, 0);
+
+    // User 1 opens a partial redemption.
+    uint256 user1Shares = ShareToken(v.sharesToken()).balanceOf(user) / 2;
+
+    vm.prank(user);
+    v.requestRedeem(user1Shares);
+
+    (uint256 user1AssetAmount,) = v.getRedeemAssetAmount(user, 0);
+    uint256 reservedAfterFirst = v.reservedAt(0);
+
+    assertEq(
+        reservedAfterFirst,
+        user1AssetAmount,
+        "first redeem reservation must match its asset amount"
+    );
+    assertLe(
+        reservedAfterFirst,
+        totalAssetBalance,
+        "first reservation cannot exceed vault balance"
+    );
+
+    // User 2 opens another partial redemption. Its allocation must come
+    // only from the remaining free Token A balance.
+    uint256 user2Shares = ShareToken(v.sharesToken()).balanceOf(user2) / 2;
+
+    vm.prank(user2);
+    v.requestRedeem(user2Shares);
+
+    (uint256 user2AssetAmount,) = v.getRedeemAssetAmount(user2, 0);
+    uint256 reservedAfterSecond = v.reservedAt(0);
+
+    assertEq(
+        reservedAfterSecond,
+        user1AssetAmount + user2AssetAmount,
+        "reservations must accumulate"
+    );
+    assertLe(
+        reservedAfterSecond,
+        totalAssetBalance,
+        "combined reservations cannot exceed vault balance"
+    );
+
+    // Settle the first redemption in-kind. Only user 1's reservation
+    // should be released.
+    vm.prank(user);
+    v.claimInKind();
+
+    assertEq(
+        v.reservedAt(0),
+        user2AssetAmount,
+        "settling user 1 must preserve user 2 reservation"
+    );
+    assertEq(v.activeRedeemCount(), 1);
+
+    // Settle the second redemption.
+    vm.prank(user2);
+    v.claimInKind();
+
+    assertEq(v.reservedAt(0), 0);
+    assertEq(v.activeRedeemCount(), 0);
+    }
+
     /// @dev #8: claimInKind pays unswapped legs in the asset (less redeem fee) plus escrow.
     function test_ClaimInKind_SettlesUnswappedLegsInAsset() public {
         Vault v = _createDirectVault(0, 100, 0);
