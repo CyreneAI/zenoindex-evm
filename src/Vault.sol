@@ -84,8 +84,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     // ── Modifiers ─────────────────────────────────────────────────────────────
     /// @dev Manager, or an operator super-admin scoped to THIS vault on ZenoIndexVault.
     modifier onlyManager() {
-        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isVaultOperator(address(this), msg.sender))
-        {
+        if (msg.sender != vaultManager && !IZenoIndexVault(zenoIndexVault).isVaultOperator(address(this), msg.sender)) {
             revert NotVaultManager();
         }
         _;
@@ -154,6 +153,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     error PathEnd();
     error AssetNotRegistered();
     error AssetNotActive();
+    error NoPrice();
     error ZeroAddress();
     error EmergencyActive();
     error RedeemNotTimedOut();
@@ -482,9 +482,14 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             // resolves to mint == address(0), and every NAV read (_sumNav -> ZenoIndexVault.sumNav
             // -> ERC20Minimal(address(0)).balanceOf(...)) then reverts, permanently
             // bricking deposit/redeem/rebalance for the whole vault.
-            (,, bool active, bool exists) = IZenoIndexVault(zenoIndexVault).getAsset(id);
+            (, address mint, bool active, bool exists) = IZenoIndexVault(zenoIndexVault).getAsset(id);
+
             if (!exists) revert AssetNotRegistered();
             if (!active) revert AssetNotActive();
+
+            if (!IZenoIndexVault(zenoIndexVault).hasPrice(mint)) {
+                revert NoPrice();
+            }
 
             int256 existingSlot = -1;
             for (uint8 i = 0; i < oldN; i++) {
@@ -905,8 +910,9 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             ids[i] = _assetIds[i];
             reserved[i] = _reservedAssets[i];
         }
-        return IZenoIndexVault(zenoIndexVault)
-            .sumNav(address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
+        return
+            IZenoIndexVault(zenoIndexVault)
+                .sumNav(address(this), ids, reserved, totalPendingUsdc + vaultRedeemEscrowTotal);
     }
 
     function _slotOf(uint64 assetId) internal view returns (uint8) {

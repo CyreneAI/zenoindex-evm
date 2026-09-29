@@ -273,6 +273,7 @@ contract ZenoIndexVaultTest is Test {
         _genesis(v, 1_000_000_000);
 
         MockERC20 tokenC = new MockERC20("Token C", "TKC", 6);
+        zenoIndexVault.setPriceWhole(address(tokenC), 1_000_000);
         uint64 assetC = zenoIndexVault.createAsset(address(tokenC));
 
         uint64[] memory ids = new uint64[](3);
@@ -290,6 +291,28 @@ contract ZenoIndexVaultTest is Test {
         assertEq(v.numAssets(), 3);
         assertEq(v.assetIdAt(2), assetC);
         assertEq(v.allocationBpsAt(2), 4000);
+    }
+
+    function test_SetTargetAllocations_RevertsWhenAssetHasNoPrice() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 6);
+        uint64 assetC = zenoIndexVault.createAsset(address(tokenC));
+
+        uint64[] memory ids = new uint64[](3);
+        ids[0] = assetA;
+        ids[1] = assetB;
+        ids[2] = assetC;
+
+        uint16[] memory bps = new uint16[](3);
+        bps[0] = 4000;
+        bps[1] = 4000;
+        bps[2] = 2000;
+
+        vm.prank(manager);
+        vm.expectRevert(Vault.NoPrice.selector);
+        v.setTargetAllocations(ids, bps);
     }
 
     function test_SetTargetAllocations_DroppedAssetGoesToZeroNotRemoved() public {
@@ -1064,8 +1087,6 @@ contract ZenoIndexVaultTest is Test {
         vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
         new ZenoIndexVault(address(usdc), address(vaultImpl), address(0));
     }
-
-
 
     /// @dev Valuation must work with prices set on ZenoIndexVault.
     function test_Deposit_UsesNavCalculationPrices() public {

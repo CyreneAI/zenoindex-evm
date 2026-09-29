@@ -24,6 +24,8 @@ interface IZenoIndexVault {
     /// @notice Values `amount` of `token` in USDC 6-decimal units.
     function valueUsdc(address token, uint256 amount) external view returns (uint256);
 
+    function hasPrice(address token) external view returns (bool);
+
     /// @notice Sums the USD (USDC 6-decimal) value of `vaultClone`'s free (non-reserved)
     ///         balances across `assetIds`.
     function sumNav(
