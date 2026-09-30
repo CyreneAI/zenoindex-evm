@@ -471,6 +471,7 @@ contract ZenoIndexVault is IZenoIndexVault {
         address usdc = usdcToken;
         uint256 n = assetIds.length;
         require(reservedAmounts.length == n, "LEN");
+        bool hasUsdcAsset;
 
         for (uint256 i = 0; i < n; i++) {
             address mint = _assets[assetIds[i]].mint;
@@ -478,12 +479,20 @@ contract ZenoIndexVault is IZenoIndexVault {
             uint256 free = bal > reservedAmounts[i] ? bal - reservedAmounts[i] : 0;
 
             if (mint == usdc) {
+                hasUsdcAsset = true;
                 free = free > excludeFromUsdcLeg ? free - excludeFromUsdcLeg : 0;
                 total += free; // $1 peg
             } else {
                 if (free == 0) continue;
                 total += _quote(mint, free);
             }
+        }
+        if (!hasUsdcAsset) {
+            uint256 usdcBal = ERC20Minimal(usdc).balanceOf(vaultClone);
+            uint256 usdcFree = usdcBal > excludeFromUsdcLeg
+                ? usdcBal - excludeFromUsdcLeg
+                : 0;
+            total += usdcFree;
         }
     }
 

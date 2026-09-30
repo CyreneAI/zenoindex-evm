@@ -411,6 +411,49 @@ contract ZenoIndexVaultTest is Test {
         assertGt(usdc.balanceOf(address(v)), usdcBefore, "sell proceeds should arrive as USDC");
     }
 
+    function test_ExecuteRebalance_SaleProceedsRemainInNav() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _depositAs(v, user, 100_000e6);
+        _deployBoth(v);
+
+        uint256 navBefore = v.totalNav();
+        uint256 usdcBefore = usdc.balanceOf(address(v));
+
+        uint64[] memory ids = new uint64[](2);
+        ids[0] = assetA;
+        ids[1] = assetB;
+
+        uint16[] memory bps = new uint16[](2);
+        bps[0] = 1000;
+        bps[1] = 9000;
+
+        vm.prank(manager);
+        v.setTargetAllocations(ids, bps);
+
+        vm.prank(manager);
+        v.executeRebalance(
+            0,
+            _pathToUsdc(address(tokenA)),
+            0
+        );
+
+        uint256 navAfter = v.totalNav();
+        uint256 usdcAfter = usdc.balanceOf(address(v));
+
+        assertGt(
+            usdcAfter,
+            usdcBefore,
+            "rebalance sale should produce USDC"
+        );
+
+        assertGt(
+            navAfter * 100,
+            navBefore * 90,
+            "NAV must include rebalance sale proceeds"
+        );
+    }
+
     function test_ExecuteRebalance_UnderweightBuyFromFreeUsdc() public {
         Vault v = _createDirectVault(0, 50, 0);
         _genesis(v, 1_000_000_000);
@@ -576,11 +619,12 @@ contract ZenoIndexVaultTest is Test {
         v.proposeWriteOff(assetA);
         zenoIndexVault.confirmWriteOff(0, assetA);
 
-        // A's pending must leave totalPendingUsdc; B compacts into slot 0.
+        // A's pending is removed from the retired slot; B compacts into slot 0.
+        // The underlying USDC remains in the vault, so total NAV is unchanged.
         assertEq(v.numAssets(), 1);
         assertEq(v.totalPendingUsdc(), pendingB);
         assertEq(v.usdcTargetAmountAt(0), pendingB);
-        assertEq(v.totalNav(), navBefore - pendingA);
+        assertEq(v.totalNav(), navBefore);
 
         // Remaining pending is still deployable via the surviving slot.
         address[] memory pathB = new address[](2);
@@ -626,6 +670,7 @@ contract ZenoIndexVaultTest is Test {
 
         // Review #11: super-admin can sweep them out.
         address recovery = address(0x5EE9);
+
         zenoIndexVault.sweepWrittenOff(0, assetA, recovery);
         assertEq(tokenA.balanceOf(address(v)), 0);
         assertEq(tokenA.balanceOf(recovery), balBefore);

@@ -81,8 +81,8 @@ contract AuditPoC is ZenoIndexVaultTest {
         zenoIndexVault.confirmWriteOff(0, assetA);
     }
 
-    // H-2 (known, still open): rebalance-sale USDC vanishes from NAV -> cheap shares.
-    function test_PoC_RebalanceSaleUnderstatesNav() public {
+    // H-2 regression: rebalance-sale USDC must remain included in NAV.
+    function test_RebalanceSaleDoesNotUnderstateNav() public {
         Vault v = _createDirectVault(0, 50, 0);
         _genesis(v, 1_000_000_000);
         _depositAs(v, user, 100_000e6);
@@ -103,7 +103,7 @@ contract AuditPoC is ZenoIndexVaultTest {
         uint256 navAfter = v.totalNav();
         emit log_named_uint("NAV before", navBefore);
         emit log_named_uint("NAV after sell", navAfter);
-        emit log_named_uint("USDC held, uncounted", usdc.balanceOf(address(v)));
-        assertLt(navAfter * 100, navBefore * 55); // NAV reads ~half while value is ~unchanged
+        emit log_named_uint("USDC held after sale", usdc.balanceOf(address(v)));
+        assertGt(navAfter * 100, navBefore * 90); // NAV reads ~half while value is ~unchanged
     }
 }
