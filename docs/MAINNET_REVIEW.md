@@ -1,6 +1,6 @@
 # ZenoIndex EVM — mainnet review
 
-**Date:** 2026-09-23
+**Date:** 2026-09-30
 **Scope:** `src/` (`Vault`, `ZenoIndexVault`, `AccessMaster`, `UniswapV4Adapter`, `VaultMath`, `Constants`, tokens, interfaces)
 **Toolchain:** Foundry 1.8.3, solc 0.8.26 (`via_ir`, cancun), OpenZeppelin 5.7.0
 **This document** merges the pre-mainnet review, the bug-fix report, and the security audit.
@@ -9,19 +9,20 @@
 
 ## Verdict: go-ahead for mainnet
 
-User-exploitable bugs that broke the contracts’ own invariants are fixed and covered by tests. What remains is either **ops** (every vault includes a USDC basket slot; keeper; post-deploy checklist) or **owner/deployer custody** (super-admin, manager, price table). Those are accepted as designed.
+User-exploitable bugs that broke the contracts’ own invariants are fixed and covered by tests. What remains is either **ops** (production vault configuration; keeper; post-deploy checklist) or **owner/deployer custody** (super-admin, manager, price table). Those are accepted as designed.
 
 This is an internal go-ahead, not a third-party audit. Super-admin, adapter admin, vault manager, and the price keeper are trusted.
 
-**Tests (local, this tree):** 168 passed, 0 failed.
+**Tests (local, this tree):** 221 passed, 0 failed, 0 skipped.
 
 | Suite | Passed |
-|---|---|
+|---|---:|
 | AccessMasterTest | 22 |
-| AuditPoC | 68 |
-| UniswapV4AdapterTest | 8 |
-| VaultMathTest | 6 |
-| ZenoIndexVaultTest | 64 |
+| AuditPoC | 75 |
+| UniswapV4AdapterTest | 11 |
+| VaultMathTest | 42 |
+| ZenoIndexVaultTest | 71 |
+| **Total** | **221** |
 
 PoCs: `forge test --match-test test_PoC -vv` (`test/AuditPoC.t.sol`).
 
@@ -29,23 +30,25 @@ PoCs: `forge test --match-test test_PoC -vv` (`test/AuditPoC.t.sol`).
 
 ## Coverage
 
-`forge coverage --ir-minimum --report summary` (same 168 tests):
+`forge coverage --ir-minimum --report summary` (current 221-test suite):
 
 | File | Lines | Statements | Branches | Funcs |
-|---|---|---|---|---|
-| `src/AccessMaster.sol` | 97.56% (40/41) | 97.50% (39/40) | 100% (9/9) | 100% (11/11) |
-| `src/Vault.sol` | 97.42% (416/427) | 89.95% (510/567) | 47.32% (53/112) | 95.65% (44/46) |
-| `src/ZenoIndexVault.sol` | 90.80% (158/174) | 83.71% (185/221) | 42.86% (21/49) | 87.10% (27/31) |
-| `src/adapters/UniswapV4Adapter.sol` | 90.77% (59/65) | 86.96% (80/92) | 33.33% (5/15) | 88.89% (8/9) |
-| `src/libraries/VaultMath.sol` | 79.66% (47/59) | 64.44% (58/90) | 6.25% (1/16) | 88.89% (8/9) |
-| `src/tokens/ERC20Minimal.sol` | 100% (32/32) | 100% (25/25) | 14.29% (1/7) | 100% (7/7) |
-| `src/tokens/ShareToken.sol` | 100% (8/8) | 100% (4/4) | 0% (0/2) | 100% (4/4) |
-| `src/mocks/MockERC20.sol` | 100% (3/3) | 100% (1/1) | — | 100% (2/2) |
-| `src/mocks/MockSwapRouter.sol` | 0% (0/15) | 0% (0/20) | 0% (0/8) | 0% (0/2) |
-| `script/Deploy.s.sol` | 0% (0/34) | 0% (0/43) | 0% (0/4) | 0% (0/2) |
-| **Total** | **88.93% (763/858)** | **81.78% (902/1103)** | **40.54% (90/222)** | **90.24% (111/123)** |
+|---|---:|---:|---:|---:|
+| `src/AccessMaster.sol` | 97.56% | 97.50% | 100.00% | 100.00% |
+| `src/Vault.sol` | 97.44% | 90.22% | 51.33% | 95.65% |
+| `src/ZenoIndexVault.sol` | 91.21% | 84.55% | 44.00% | 87.50% |
+| `src/adapters/UniswapV4Adapter.sol` | 90.77% | 86.96% | 53.33% | 88.89% |
+| `src/libraries/VaultMath.sol` | 96.61% | 96.67% | 93.75% | 100.00% |
+| `src/tokens/ERC20Minimal.sol` | 100.00% | 100.00% | 14.29% | 100.00% |
+| `src/tokens/ShareToken.sol` | 100.00% | 100.00% | 0.00% | 100.00% |
+| `src/mocks/MockERC20.sol` | 100.00% | 100.00% | — | 100.00% |
+| `src/mocks/MockSwapRouter.sol` | 0.00% | 0.00% | 0.00% | 0.00% |
+| `script/Deploy.s.sol` | 0.00% | 0.00% | 0.00% | 0.00% |
+| **Total** | **90.22%** | **85.23%** | **50.45%** | **91.13%** |
 
-Deploy script and `MockSwapRouter` are unused by the suite (vault tests go through a real V4 `PoolManager`). Branch coverage is thin on `VaultMath` (6%) and the adapter (33%) — error paths more than happy paths.
+Deploy script and `MockSwapRouter` are unused by the suite (vault tests go through a real V4 `PoolManager`). The current suite materially expands coverage of financial math and defensive error paths. `VaultMath` now has 93.75% branch coverage with deterministic and fuzz tests, while `AccessMaster` has 100% branch coverage. Adapter branch coverage is 53.33% after adding constructor, pool configuration, and callback authorization regressions.
+
+Remaining uncovered branches are primarily defensive or internally inconsistent states rather than demonstrated user-exploitable bugs. No additional tests were added solely to maximize the coverage percentage.
 
 ---
 
@@ -78,6 +81,24 @@ Severity: **High** = users lose value or anyone can freeze a vault. **Medium** =
 
 **B-7.** Shared `_quoteDeposit` for deposit and preview. Pending recorded from `fee.netAmount`.
 
+### Phase 1 hardening fixes
+
+| ID | Issue | Severity | Regression coverage |
+|---|---|---|---|
+| H-1 / O-1 | Unregistered/spare USDC could be omitted from NAV after rebalance sale proceeds | High | `test_ExecuteRebalance_SaleProceedsRemainInNav`, `test_RebalanceSaleDoesNotUnderstateNav` |
+| M-1 | Target allocations could previously include an unpriced asset | Medium | `test_SetTargetAllocations_RevertsWhenAssetHasNoPrice` |
+
+**H-1 / O-1.** `sumNav` now accounts for free USDC held by the vault even when USDC is not registered as an asset slot. Rebalance sale proceeds therefore remain included in NAV.
+
+**M-1.** `setTargetAllocations` now requires every non-USDC target asset to have a configured price through `hasPrice()`.
+---
+### Phase 2 hardening
+
+- **UniswapV4Adapter:** added defensive regression tests covering zero-address constructor inputs, zero-token pool configuration, and unauthorized `unlockCallback` callers.
+- **Vault reactivation:** strengthened reactivation coverage to verify that written-off balances remain in custody, the written-off state is cleared, the balance is restored, and the asset returns as a 0%-target slot.
+- **AccessMaster:** reviewed two-step super-admin transfer semantics and verified that `ADMIN_ROLE` cannot be directly granted, revoked, or renounced.
+- **ShareToken:** reviewed the 6-decimal share-token configuration against the internal `PRICE_SCALE`; no production change was required.
+
 ---
 
 ## Design changes (also shipped)
@@ -102,15 +123,7 @@ Fee-on-transfer / rebasing: swaps revert instead of mis-counting. `createAsset` 
 
 ### Operate (no extra code)
 
-**H-1 / O-1 — Spare USDC missing from NAV without a USDC slot (High).**  
-`sumNav` only values USDC when USDC is a basket slot. A rebalance *sale* (or retired pending) then sits uncounted. PoC `test_PoC_RebalanceSaleUnderstatesNav`: NAV dropped from ~99,940 to ~49,980 USDC while ~49,942 USDC sat in the vault. Anyone depositing in that window mints cheap shares.
-
-**Ship rule:** every production vault includes a **USDC slot** in `assetIds` / `allocationBps`. With that slot, `sumNav` already counts the cash. Do not ship a 100% non-stable basket.
-
-**M-1 — Unpriced asset on retarget (Medium).**  
-`createVault` requires a price; `setTargetAllocations` does not. A 1-wei donation of an unpriced mint reverts every NAV read (`test_PoC_UnpricedAssetDonationBricksDeposits`).
-
-**Ship rule:** only retarget to assets that already have `setPrice` / `setPriceWhole`. Same screen as `createVault`.
+**Ship rule:** every production vault includes a **USDC slot** in `assetIds` / `allocationBps` as the production deployment convention. This keeps the basket explicit about its stablecoin leg.
 
 Also: post-deploy checklist (below), daily price keeper, no fee-on-transfer or rebasing mints.
 
@@ -163,7 +176,11 @@ If `Deploy.s.sol` used a hot EOA as super-admin, two-step `setSuperAdmin` / `acc
 
 ## Limitations
 
-Manual review plus the 168-test suite. No fuzzing or formal verification. `lib/`, keepers, and live V4 pool config are out of scope. Branch coverage on `VaultMath` and adapter error paths is low. Re-run:
+Manual review plus the current 221-test suite. The suite includes targeted fuzz tests for VaultMath financial invariants. No formal verification was performed. `lib/`, keepers, and live V4 pool configuration remain out of scope.
+
+Branch coverage remains intentionally incomplete for several defensive or internally inconsistent states. Coverage was not treated as a substitute for security analysis.
+
+Re-run:
 
 ```bash
 forge test --summary
