@@ -563,6 +563,14 @@ contract ZenoIndexVaultTest is Test {
         assertEq(tokenB.balanceOf(address(v)), Constants.RETIRE_DUST_USDC, "dust is left untracked, not sold");
     }
 
+    function test_ExecuteWriteOff_RevertsWithoutPendingProposal() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        vm.expectRevert(Vault.NoPendingWriteOff.selector);
+        zenoIndexVault.confirmWriteOff(0, assetA);
+    }
+
     // ── Path B write-off ──────────────────────────────────────────────────────
 
     function test_WriteOff_RequiresManagerProposeAndSuperAdminConfirm() public {
@@ -582,6 +590,28 @@ contract ZenoIndexVaultTest is Test {
 
         zenoIndexVault.confirmWriteOff(0, assetA); // superAdmin = address(this) in this test
         assertTrue(v.isWrittenOff(assetA));
+    }
+
+    function test_WriteOff_RevertsForUsdcAsset() public {
+        uint64 usdcAsset = zenoIndexVault.createAsset(address(usdc));
+
+        uint64[] memory ids = new uint64[](1);
+        ids[0] = usdcAsset;
+
+        uint16[] memory bps = new uint16[](1);
+        bps[0] = 10_000;
+
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        vm.prank(manager);
+        v.setTargetAllocations(ids, bps);
+
+        vm.prank(manager);
+        v.proposeWriteOff(usdcAsset);
+
+        vm.expectRevert(Vault.UsdcNotWriteOffable.selector);
+        zenoIndexVault.confirmWriteOff(0, usdcAsset);
     }
 
     function test_WriteOff_RemovesAssetFromNavAndSlotCount() public {
@@ -636,21 +666,49 @@ contract ZenoIndexVaultTest is Test {
         assertApproxEqRel(tokenB.balanceOf(address(v)), pendingB, 0.01e18);
     }
 
-    function test_Reactivate_RestoresAssetToZeroBpsSlot() public {
+    function test_ExecuteReactivate_RevertsWithoutPendingProposal() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        vm.expectRevert(Vault.NoPendingReactivate.selector);
+        zenoIndexVault.confirmReactivate(0, assetA);
+    }
+
+    function test_ProposeReactivate_RevertsWhenAssetIsNotWrittenOff() public {
         Vault v = _createDirectVault(0, 50, 0);
         _genesis(v, 1_000_000_000);
 
         vm.prank(manager);
+        vm.expectRevert(Vault.NotWrittenOff.selector);
+        v.proposeReactivate(assetA);
+    }
+
+    function test_Reactivate_RestoresAssetToZeroBpsSlot() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        uint256 balanceBeforeWriteOff = tokenA.balanceOf(address(v));
+        assertGt(balanceBeforeWriteOff, 0);
+
+        vm.prank(manager);
         v.proposeWriteOff(assetA);
         zenoIndexVault.confirmWriteOff(0, assetA);
+
+        assertTrue(v.isWrittenOff(assetA));
+        assertEq(v.writtenOffBalance(assetA), balanceBeforeWriteOff);
+        assertEq(tokenA.balanceOf(address(v)), balanceBeforeWriteOff);
 
         vm.prank(manager);
         v.proposeReactivate(assetA);
         zenoIndexVault.confirmReactivate(0, assetA);
 
         assertFalse(v.isWrittenOff(assetA));
+        assertEq(v.writtenOffBalance(assetA), 0);
+        assertEq(tokenA.balanceOf(address(v)), balanceBeforeWriteOff);
+
         assertEq(v.numAssets(), 2);
-        assertEq(v.allocationBpsAt(1), 0); // reactivated at 0% — manager re-weights separately
+        assertEq(v.allocationBpsAt(1), 0);
     }
 
     function test_WriteOff_LeavesTokensInCustodyUntilSwept() public {

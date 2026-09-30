@@ -184,4 +184,29 @@ contract UniswapV4AdapterTest is Test {
         adapter.setPool(currency0Addr, address(tokenC), FEE, TICK_SPACING, hook);
         vm.stopPrank();
     }
+
+    function test_constructor_revertsOnZeroAddress() public {
+        vm.expectRevert(UniswapV4Adapter.ZeroAddress.selector);
+        new UniswapV4Adapter(address(0), admin);
+
+        vm.expectRevert(UniswapV4Adapter.ZeroAddress.selector);
+        new UniswapV4Adapter(address(manager), address(0));
+    }
+
+    function test_setPool_revertsOnZeroToken() public {
+        vm.startPrank(admin);
+
+        vm.expectRevert(UniswapV4Adapter.ZeroAddress.selector);
+        adapter.setPool(address(0), currency1Addr, FEE, TICK_SPACING, address(0));
+
+        vm.expectRevert(UniswapV4Adapter.ZeroAddress.selector);
+        adapter.setPool(currency0Addr, address(0), FEE, TICK_SPACING, address(0));
+
+        vm.stopPrank();
+    }
+
+    function test_unlockCallback_revertsForNonPoolManager() public {
+        vm.expectRevert(UniswapV4Adapter.OnlyPoolManager.selector);
+        adapter.unlockCallback("");
+}
 }
