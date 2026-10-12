@@ -157,3 +157,6 @@ out/
 .env
 .env.*
 !.env.example
+# Foundry deployment artifacts
+broadcast/**/run-latest.json
+broadcast/**/run-latest.recovery.lock

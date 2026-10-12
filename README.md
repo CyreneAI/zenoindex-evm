@@ -570,6 +570,43 @@ Do not rely only on console output. Independently read state from deployed contr
 
 Keep transaction hashes, block numbers, addresses, compiler version, and test results with the deployment record. Never describe a simulated transaction as deployed.
 
+### Verified Robinhood Chain Mainnet Adapter Deployment
+
+The Uniswap V4 adapter has been deployed and configured on Robinhood Chain mainnet (chain ID `4663`).
+
+**Deployed configuration**
+
+| Item | Value |
+|---|---|
+| `ZenoIndexVault` factory | `0xD00ABbC1d1555a173c5081b2204579b057B05378` |
+| Adapter | `0x1CD3F47e7137761e4c1066273893fbE778BB2Dd7` |
+| PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| Configured base token (USDG) | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+| NVDA token | `0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC` |
+| Pool fee | `100` |
+| Tick spacing | `1` |
+| Hooks | Zero address |
+| Registered pair ID | `0x447bb1000fcf9205e84b0f455d80abde4d02b952066ad172602c5489c949443a` |
+
+**Deployment transactions**
+
+| Operation | Transaction hash |
+|---|---|
+| Deploy adapter | `0xc5a82c66d9acc0b0b6b329750282a662c2b7fd5226190b3d798fde2e9a89bc2c` |
+| Authorize factory | `0xe591c57f29518498ec24998656b5de805dc215edda131cb1e888459eaa1b5ef7` |
+| Register pool | `0xb9522742cbdfe0778296625252011af9a99cc5cacb1c424d1901f7531bd7d1e0` |
+| Configure factory router | `0x13947a3f8125a65e22109657b4c0015f1b7a5f21f99696642cff2da9aa6a5dda` |
+
+**Verification status**
+
+The adapter's deployed bytecode, admin, PoolManager, factory authorization, registered pair, factory router, and configured USDG token were verified through on-chain reads. The USDG/NVDA pool-state inspection also found initialized candidate pools with nonzero liquidity for the inspected configurations.
+
+These checks do not prove that an end-to-end vault swap succeeds for a particular trade size. A successful live swap, price impact, and production readiness remain unconfirmed. Run the project's tests and complete an appropriately controlled end-to-end swap test before treating the route as production-ready.
+
+**Network:** Robinhood Chain mainnet
+
+**RPC:** `https://rpc.mainnet.chain.robinhood.com`
+
 ## Security and operational requirements
 
 Read [`docs/MAINNET_REVIEW.md`](docs/MAINNET_REVIEW.md) before deploying. It records the internal review, bugs fixed, regression tests, accepted risks, and operational recommendations.
