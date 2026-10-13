@@ -453,7 +453,11 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     function hasPrice(address token) external view returns (bool) {
-    return token == usdcToken || priceDen[token] != 0;
+        if (token == usdcToken) return true;
+        if (priceDen[token] == 0) return false;
+
+        uint256 age = maxPriceAge;
+        return age == 0 || block.timestamp <= priceUpdatedAt[token] + age;
     }
 
     /// @notice Sums the USD (USDC 6-decimal) value of `vaultClone`'s free (non-reserved)

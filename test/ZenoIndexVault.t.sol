@@ -1343,6 +1343,13 @@ contract ZenoIndexVaultTest is Test {
     }
 
     /// @dev #2: a price older than maxPriceAge blocks NAV reads (and so deposits).
+    function test_HasPrice_ReturnsFalseWhenPriceIsStale() public {
+        assertTrue(zenoIndexVault.hasPrice(address(tokenA)));
+        vm.warp(block.timestamp + zenoIndexVault.maxPriceAge() + 1);
+        assertFalse(zenoIndexVault.hasPrice(address(tokenA)));
+        assertTrue(zenoIndexVault.hasPrice(address(usdc)));
+    }
+
     function test_StalePrice_BlocksDepositUntilRefreshed() public {
         Vault v = _createDirectVault(0, 50, 0);
         _genesis(v, 1_000_000_000);
