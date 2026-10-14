@@ -214,6 +214,20 @@ The following files define interfaces or test helpers:
 
 Mocks are testing utilities, not production contracts.
 
+### `FeeEscrow.sol`
+
+**What it does:** Holds and accounts for accrued platform and vault-manager fees across vault clones.
+
+Key behaviors:
+
+- Only registered vault clones can account for fees.
+- The vault transfers fee tokens to the escrow and supplies the fee split calculated by `VaultMath`.
+- The current fee split allocates 20% of the fee amount to the platform and 80% to the vault manager.
+- Managers claim their accumulated fees using `claimManagerFees`.
+- The configured treasury claims platform fees using `claimPlatformFees`.
+- `totalClaimable` tracks accrued liabilities by token, and accounting checks that the escrow balance covers those liabilities.
+- `FeeType` defines Deposit, Redemption, and Trading categories. Trading-fee collection is not yet integrated into the vault flow.
+
 ## Protocol lifecycle
 
 ### 1. Deploy and configure

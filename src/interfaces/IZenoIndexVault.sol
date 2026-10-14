@@ -9,6 +9,7 @@ pragma solidity ^0.8.13;
 interface IZenoIndexVault {
     function superAdmin() external view returns (address);
     function treasury() external view returns (address);
+    function feeEscrow() external view returns (address);
     function usdcToken() external view returns (address);
     function isEmergency() external view returns (bool);
     function router() external view returns (address);

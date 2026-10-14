@@ -12,6 +12,16 @@ import {ShareToken} from "./tokens/ShareToken.sol";
 import {VaultMath} from "./libraries/VaultMath.sol";
 import {Constants} from "./libraries/Constants.sol";
 
+interface IFeeEscrowAccount {
+    enum FeeType {
+        Deposit,
+        Redemption,
+        Trading
+    }
+
+    function accountFee(address token, uint256 companyFee, uint256 managerFee, FeeType feeType) external;
+}
+
 /// @notice ERC-1167 clone implementation — one instance per ETF. Owns all per-vault storage.
 ///         Reads NAV/valuation, swap execution, and role/asset-registry data live from
 ///         `zenoIndexVault` on every call — never caches them.
@@ -158,6 +168,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
     error EmergencyActive();
     error RedeemNotTimedOut();
     error UsdcNotWriteOffable();
+    error FeeEscrowNotConfigured();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -275,7 +286,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
 
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
         IERC20(usdc).safeTransferFrom(msg.sender, address(this), grossUsdc);
-        _payFees(usdc, fee);
+        _payFees(usdc, fee, IFeeEscrowAccount.FeeType.Deposit);
 
         ShareToken(sharesToken).mint(msg.sender, sharesMinted);
         totalShares += sharesMinted;
@@ -729,7 +740,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         vaultRedeemEscrowTotal -= grossUsdc;
 
         address usdc = IZenoIndexVault(zenoIndexVault).usdcToken();
-        _payFees(usdc, fee);
+        _payFees(usdc, fee, IFeeEscrowAccount.FeeType.Redemption);
         IERC20(usdc).safeTransfer(user, fee.netAmount);
     }
 
@@ -745,7 +756,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             _reservedAssets[i] = _reservedAssets[i] > amount ? _reservedAssets[i] - amount : 0;
             (, address mint,,) = IZenoIndexVault(zenoIndexVault).getAsset(_assetIds[i]);
             VaultMath.FeeSplit memory assetFee = VaultMath.computeFeeSplit(amount, redeemFeeBps);
-            _payFees(mint, assetFee);
+            _payFees(mint, assetFee, IFeeEscrowAccount.FeeType.Redemption);
             if (assetFee.netAmount > 0) IERC20(mint).safeTransfer(user, assetFee.netAmount);
         }
 
@@ -766,13 +777,15 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
         }
     }
 
-    function _payFees(address token, VaultMath.FeeSplit memory fee) internal {
-        if (fee.companyFee > 0) {
-            IERC20(token).safeTransfer(IZenoIndexVault(zenoIndexVault).treasury(), fee.companyFee);
-        }
-        if (fee.managerFee > 0) {
-            IERC20(token).safeTransfer(feeRecipient, fee.managerFee);
-        }
+    function _payFees(address token, VaultMath.FeeSplit memory fee, IFeeEscrowAccount.FeeType feeType) internal {
+        uint256 totalFee = fee.companyFee + fee.managerFee;
+        if (totalFee == 0) return;
+
+        address escrow = IZenoIndexVault(zenoIndexVault).feeEscrow();
+        if (escrow == address(0)) revert FeeEscrowNotConfigured();
+
+        IERC20(token).safeTransfer(escrow, totalFee);
+        IFeeEscrowAccount(escrow).accountFee(token, fee.companyFee, fee.managerFee, feeType);
     }
 
     function _resetRedeem(RedeemState storage rs) internal {

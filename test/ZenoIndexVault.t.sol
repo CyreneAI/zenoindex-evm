@@ -3,6 +3,7 @@ pragma solidity ^0.8.13;
 
 import {Test} from "forge-std/Test.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
+import {FeeEscrow} from "../src/FeeEscrow.sol";
 import {Vault} from "../src/Vault.sol";
 import {AccessMaster} from "../src/AccessMaster.sol";
 import {Constants} from "../src/libraries/Constants.sol";
@@ -21,6 +22,7 @@ contract ZenoIndexVaultTest is Test {
     ZenoIndexVault internal zenoIndexVault;
     Vault internal vaultImpl;
     AccessMaster internal accessMaster;
+    FeeEscrow internal feeEscrow;
     MockERC20 internal usdc;
     MockERC20 internal tokenA;
     MockERC20 internal tokenB;
@@ -55,6 +57,8 @@ contract ZenoIndexVaultTest is Test {
         vaultImpl = new Vault();
         accessMaster = new AccessMaster(address(this), treasury);
         zenoIndexVault = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
+        feeEscrow = new FeeEscrow(address(zenoIndexVault), address(accessMaster));
+        zenoIndexVault.setFeeEscrow(address(feeEscrow));
 
         zenoIndexVault.setSwapRouter(address(router));
         vm.prank(dexAdmin);
@@ -77,6 +81,74 @@ contract ZenoIndexVaultTest is Test {
     /// @dev Registers a real V4 pool for `x`/`y` on `router` and seeds it with deep,
     ///      balanced LP liquidity around a 1:1 price so ordinary-sized swaps in these
     ///      tests see only minor price impact.
+    function test_SetFeeEscrow_UpdatesValidEscrow() public {
+        FeeEscrow replacement = new FeeEscrow(address(zenoIndexVault), address(accessMaster));
+
+        vm.expectEmit(true, true, false, true, address(zenoIndexVault));
+        emit ZenoIndexVault.FeeEscrowUpdated(address(feeEscrow), address(replacement));
+
+        zenoIndexVault.setFeeEscrow(address(replacement));
+
+        assertEq(zenoIndexVault.feeEscrow(), address(replacement));
+    }
+
+
+    function test_SetFeeEscrow_OldEscrowClaimsRemainAvailable() public {
+        Vault v = _createDirectVault(100, 50, 0);
+        _genesis(v, 1_000_000_000);
+
+        uint256 depositAmount = 100_000_000;
+        vm.startPrank(user);
+        usdc.approve(address(v), depositAmount);
+        v.deposit(depositAmount, 0);
+        vm.stopPrank();
+
+        uint256 expectedPlatformFee = 200_000;
+        uint256 expectedManagerFee = 800_000;
+
+        assertEq(feeEscrow.platformClaimable(address(usdc)), expectedPlatformFee);
+        assertEq(feeEscrow.managerClaimable(manager, address(usdc)), expectedManagerFee);
+
+        FeeEscrow oldEscrow = feeEscrow;
+        FeeEscrow replacement = new FeeEscrow(address(zenoIndexVault), address(accessMaster));
+
+        zenoIndexVault.setFeeEscrow(address(replacement));
+
+        assertEq(zenoIndexVault.feeEscrow(), address(replacement));
+        assertEq(oldEscrow.platformClaimable(address(usdc)), expectedPlatformFee);
+        assertEq(oldEscrow.managerClaimable(manager, address(usdc)), expectedManagerFee);
+
+        vm.prank(treasury);
+        oldEscrow.claimPlatformFees(address(usdc));
+
+        vm.prank(manager);
+        oldEscrow.claimManagerFees(address(usdc), feeRecipient);
+
+        assertEq(usdc.balanceOf(treasury), expectedPlatformFee);
+        assertEq(usdc.balanceOf(feeRecipient), expectedManagerFee);
+        assertEq(oldEscrow.totalClaimable(address(usdc)), 0);
+    }
+
+
+    function test_SetFeeEscrow_RevertsForUnauthorizedCaller() public {
+        vm.prank(user);
+        vm.expectRevert(ZenoIndexVault.NotSuperAdmin.selector);
+        zenoIndexVault.setFeeEscrow(address(feeEscrow));
+    }
+
+    function test_SetFeeEscrow_RevertsForZeroAddress() public {
+        vm.expectRevert(ZenoIndexVault.ZeroAddress.selector);
+        zenoIndexVault.setFeeEscrow(address(0));
+    }
+
+    function test_SetFeeEscrow_RevertsForDifferentFactory() public {
+        ZenoIndexVault otherFactory = new ZenoIndexVault(address(usdc), address(vaultImpl), address(accessMaster));
+        FeeEscrow wrongEscrow = new FeeEscrow(address(otherFactory), address(accessMaster));
+
+        vm.expectRevert(ZenoIndexVault.InvalidFeeEscrow.selector);
+        zenoIndexVault.setFeeEscrow(address(wrongEscrow));
+    }
+
     function _initPoolAndSeed(address x, address y) internal {
         (address c0, address c1) = x < y ? (x, y) : (y, x);
         PoolKey memory key = PoolKey({
@@ -202,6 +274,14 @@ contract ZenoIndexVaultTest is Test {
         uint256 sharesOut = v.deposit(depositAmt, previewShares);
         vm.stopPrank();
         assertEq(sharesOut, previewShares);
+        assertEq(feeEscrow.platformClaimable(address(usdc)), companyFee);
+        assertEq(feeEscrow.managerClaimable(manager, address(usdc)), managerFee);
+
+        vm.prank(treasury);
+        feeEscrow.claimPlatformFees(address(usdc));
+        vm.prank(manager);
+        feeEscrow.claimManagerFees(address(usdc), feeRecipient);
+
         assertEq(usdc.balanceOf(treasury), companyFee);
         assertEq(usdc.balanceOf(feeRecipient), managerFee);
 
@@ -432,26 +512,14 @@ contract ZenoIndexVaultTest is Test {
         v.setTargetAllocations(ids, bps);
 
         vm.prank(manager);
-        v.executeRebalance(
-            0,
-            _pathToUsdc(address(tokenA)),
-            0
-        );
+        v.executeRebalance(0, _pathToUsdc(address(tokenA)), 0);
 
         uint256 navAfter = v.totalNav();
         uint256 usdcAfter = usdc.balanceOf(address(v));
 
-        assertGt(
-            usdcAfter,
-            usdcBefore,
-            "rebalance sale should produce USDC"
-        );
+        assertGt(usdcAfter, usdcBefore, "rebalance sale should produce USDC");
 
-        assertGt(
-            navAfter * 100,
-            navBefore * 90,
-            "NAV must include rebalance sale proceeds"
-        );
+        assertGt(navAfter * 100, navBefore * 90, "NAV must include rebalance sale proceeds");
     }
 
     function test_ExecuteRebalance_UnderweightBuyFromFreeUsdc() public {
@@ -1489,86 +1557,64 @@ contract ZenoIndexVaultTest is Test {
         vm.stopPrank();
     }
 
-    function test_RequestRedeem_MultipleRedemptionsRespectReservedAssets()
-        public
-{
-    Vault v = _createDirectVault(0, 50, 0);
-    _genesis(v, 1_000_000_000);
+    function test_RequestRedeem_MultipleRedemptionsRespectReservedAssets() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
 
-    address user2 = address(0xE55);
+        address user2 = address(0xE55);
 
-    // Give both users shares.
-    _depositAs(v, user, 100e6);
-    _depositAs(v, user2, 100e6);
+        // Give both users shares.
+        _depositAs(v, user, 100e6);
+        _depositAs(v, user2, 100e6);
 
-    // Deploy the vault's USDC into Token A so redemptions have an asset
-    // balance to reserve.
-    vm.startPrank(manager);
-    v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
-    vm.stopPrank();
+        // Deploy the vault's USDC into Token A so redemptions have an asset
+        // balance to reserve.
+        vm.startPrank(manager);
+        v.swapUsdcToAsset(0, _pathUsdcTo(address(tokenA)), 0);
+        vm.stopPrank();
 
-    uint256 totalAssetBalance = tokenA.balanceOf(address(v));
-    assertGt(totalAssetBalance, 0);
+        uint256 totalAssetBalance = tokenA.balanceOf(address(v));
+        assertGt(totalAssetBalance, 0);
 
-    // User 1 opens a partial redemption.
-    uint256 user1Shares = ShareToken(v.sharesToken()).balanceOf(user) / 2;
+        // User 1 opens a partial redemption.
+        uint256 user1Shares = ShareToken(v.sharesToken()).balanceOf(user) / 2;
 
-    vm.prank(user);
-    v.requestRedeem(user1Shares);
+        vm.prank(user);
+        v.requestRedeem(user1Shares);
 
-    (uint256 user1AssetAmount,) = v.getRedeemAssetAmount(user, 0);
-    uint256 reservedAfterFirst = v.reservedAt(0);
+        (uint256 user1AssetAmount,) = v.getRedeemAssetAmount(user, 0);
+        uint256 reservedAfterFirst = v.reservedAt(0);
 
-    assertEq(
-        reservedAfterFirst,
-        user1AssetAmount,
-        "first redeem reservation must match its asset amount"
-    );
-    assertLe(
-        reservedAfterFirst,
-        totalAssetBalance,
-        "first reservation cannot exceed vault balance"
-    );
+        assertEq(reservedAfterFirst, user1AssetAmount, "first redeem reservation must match its asset amount");
+        assertLe(reservedAfterFirst, totalAssetBalance, "first reservation cannot exceed vault balance");
 
-    // User 2 opens another partial redemption. Its allocation must come
-    // only from the remaining free Token A balance.
-    uint256 user2Shares = ShareToken(v.sharesToken()).balanceOf(user2) / 2;
+        // User 2 opens another partial redemption. Its allocation must come
+        // only from the remaining free Token A balance.
+        uint256 user2Shares = ShareToken(v.sharesToken()).balanceOf(user2) / 2;
 
-    vm.prank(user2);
-    v.requestRedeem(user2Shares);
+        vm.prank(user2);
+        v.requestRedeem(user2Shares);
 
-    (uint256 user2AssetAmount,) = v.getRedeemAssetAmount(user2, 0);
-    uint256 reservedAfterSecond = v.reservedAt(0);
+        (uint256 user2AssetAmount,) = v.getRedeemAssetAmount(user2, 0);
+        uint256 reservedAfterSecond = v.reservedAt(0);
 
-    assertEq(
-        reservedAfterSecond,
-        user1AssetAmount + user2AssetAmount,
-        "reservations must accumulate"
-    );
-    assertLe(
-        reservedAfterSecond,
-        totalAssetBalance,
-        "combined reservations cannot exceed vault balance"
-    );
+        assertEq(reservedAfterSecond, user1AssetAmount + user2AssetAmount, "reservations must accumulate");
+        assertLe(reservedAfterSecond, totalAssetBalance, "combined reservations cannot exceed vault balance");
 
-    // Settle the first redemption in-kind. Only user 1's reservation
-    // should be released.
-    vm.prank(user);
-    v.claimInKind();
+        // Settle the first redemption in-kind. Only user 1's reservation
+        // should be released.
+        vm.prank(user);
+        v.claimInKind();
 
-    assertEq(
-        v.reservedAt(0),
-        user2AssetAmount,
-        "settling user 1 must preserve user 2 reservation"
-    );
-    assertEq(v.activeRedeemCount(), 1);
+        assertEq(v.reservedAt(0), user2AssetAmount, "settling user 1 must preserve user 2 reservation");
+        assertEq(v.activeRedeemCount(), 1);
 
-    // Settle the second redemption.
-    vm.prank(user2);
-    v.claimInKind();
+        // Settle the second redemption.
+        vm.prank(user2);
+        v.claimInKind();
 
-    assertEq(v.reservedAt(0), 0);
-    assertEq(v.activeRedeemCount(), 0);
+        assertEq(v.reservedAt(0), 0);
+        assertEq(v.activeRedeemCount(), 0);
     }
 
     /// @dev #8: claimInKind pays unswapped legs in the asset (less redeem fee) plus escrow.
@@ -1587,8 +1633,42 @@ contract ZenoIndexVaultTest is Test {
         (uint256 legA,) = v.getRedeemAssetAmount(user, 0);
         (uint256 legB,) = v.getRedeemAssetAmount(user, 1);
         v.swapAssetToUsdc(0, _pathToUsdc(address(tokenA)), 0); // swap A, leave B in-kind
+
         uint256 usdcBefore = usdc.balanceOf(user);
+        uint256 grossUsdc = v.redeemUsdcBal(user);
+
+        // Snapshot claimable fees so this test checks only this redemption's fees.
+        uint256 platformUsdcBefore = feeEscrow.platformClaimable(address(usdc));
+        uint256 managerUsdcBefore = feeEscrow.managerClaimable(manager, address(usdc));
+        uint256 platformTokenBBefore = feeEscrow.platformClaimable(address(tokenB));
+        uint256 managerTokenBBefore = feeEscrow.managerClaimable(manager, address(tokenB));
+
         v.claimInKind();
+
+        uint256 usdcFee = (grossUsdc * 100) / 10_000;
+        uint256 tokenBFee = (legB * 100) / 10_000;
+
+        assertEq(
+            feeEscrow.platformClaimable(address(usdc)) - platformUsdcBefore,
+            (usdcFee * 2_000) / 10_000,
+            "platform receives 20% of USDC redemption fee"
+        );
+        assertEq(
+            feeEscrow.managerClaimable(manager, address(usdc)) - managerUsdcBefore,
+            usdcFee - (usdcFee * 2_000) / 10_000,
+            "manager receives 80% of USDC redemption fee"
+        );
+        assertEq(
+            feeEscrow.platformClaimable(address(tokenB)) - platformTokenBBefore,
+            (tokenBFee * 2_000) / 10_000,
+            "platform receives 20% of in-kind asset fee"
+        );
+        assertEq(
+            feeEscrow.managerClaimable(manager, address(tokenB)) - managerTokenBBefore,
+            tokenBFee - (tokenBFee * 2_000) / 10_000,
+            "manager receives 80% of in-kind asset fee"
+        );
+
         vm.stopPrank();
 
         assertGt(legA, 0);
