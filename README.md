@@ -228,6 +228,17 @@ Key behaviors:
 - `totalClaimable` tracks accrued liabilities by token, and accounting checks that the escrow balance covers those liabilities.
 - `FeeType` defines Deposit, Redemption, and Trading categories. Trading-fee collection is not yet integrated into the vault flow.
 
+### `VaultLens.sol`
+
+**What it does:** Read-only NAV, AUM, and per-asset allocation view over vault clones. It holds no state and needs no role, so it works against already-deployed vaults and can be called without deploying (a deployless `eth_call`).
+
+- `getVault(vault)` / `getVaults(vaults)` return, per vault: total NAV, NAV per share, pending and unallocated USDC, USDC owed to redeemers (escrow and reserved assets), AUM, written-off assets, and per asset the free amount, USDC value, current vs. target weight in bps, and price status.
+- `navOf(vault)` is a non-reverting `Vault.totalNav()`: returns `(nav, complete)`.
+- It mirrors `ZenoIndexVault.sumNav` exactly. When `complete` is true, the lens NAV equals `Vault.totalNav()`. When a held asset's price is stale or missing, `totalNav()` reverts; the lens instead values that asset at its last stored price (0 if none) and reports `complete = false`.
+- **NAV** (`totalNavUsdc`) is the net asset value: what current shareholders own. **AUM** (`aumUsdc`) is the total value of assets the vault manages: NAV plus the USDC and reserved assets still owed to redeemers who have already burned their shares. The two are equal whenever no redemption is in flight. Written-off assets are in neither.
+- Current weights are measured against total NAV, with pending and unallocated USDC as their own rows, so all rows add up to 100% (less rounding).
+- Slot indices shift when a slot retires; key rows on `assetId`.
+
 ## Protocol lifecycle
 
 ### 1. Deploy and configure
@@ -338,6 +349,8 @@ These checks do not eliminate market, liquidity, pricing, or administrative-key 
 │   ├── adapters/
 │   │   └── UniswapV4Adapter.sol
 │   ├── interfaces/
+│   ├── lens/
+│   │   └── VaultLens.sol
 │   ├── libraries/
 │   │   ├── Constants.sol
 │   │   └── VaultMath.sol
