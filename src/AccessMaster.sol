@@ -25,6 +25,8 @@ contract AccessMaster is AccessControl, IAccessMaster {
 
     // ── State ─────────────────────────────────────────────────────────────────
     address public treasury;
+    uint16 public tradingFeeBps;
+    uint16 public constant MAX_TRADING_FEE_BPS = 200;
 
     /// @dev Plain AccessControl has no built-in "who holds this role" enumeration, so the
     ///      single ADMIN_ROLE holder is tracked explicitly here — kept in sync by the
@@ -40,11 +42,13 @@ contract AccessMaster is AccessControl, IAccessMaster {
     event OperatorAdded(address indexed account);
     event OperatorRemoved(address indexed account);
     event TreasuryUpdated(address indexed treasury);
+    event TradingFeeUpdated(uint16 feeBps);
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error ZeroAddress();
     error NotPendingSuperAdmin();
     error AdminRoleManagedBySetSuperAdmin();
+    error TradingFeeOutOfBounds();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -112,6 +116,12 @@ contract AccessMaster is AccessControl, IAccessMaster {
     function removeOperator(address account) external onlyRole(ADMIN_ROLE) {
         _revokeRole(OPERATOR_ROLE, account);
         emit OperatorRemoved(account);
+    }
+
+    function setTradingFeeBps(uint16 feeBps) external onlyRole(ADMIN_ROLE) {
+        if (feeBps > MAX_TRADING_FEE_BPS) revert TradingFeeOutOfBounds();
+        tradingFeeBps = feeBps;
+        emit TradingFeeUpdated(feeBps);
     }
 
     function setTreasury(address treasury_) external onlyRole(ADMIN_ROLE) {

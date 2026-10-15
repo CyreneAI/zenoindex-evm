@@ -7,4 +7,5 @@ interface IAccessMaster {
     function superAdmin() external view returns (address);
     function isOperator(address account) external view returns (bool);
     function treasury() external view returns (address);
+    function tradingFeeBps() external view returns (uint16);
 }
