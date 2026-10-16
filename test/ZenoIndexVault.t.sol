@@ -1458,6 +1458,14 @@ contract ZenoIndexVaultTest is Test {
         zenoIndexVault.createVault(_singleAssetParams(id));
     }
 
+    function test_SetMaxPriceChangeBps_RejectsAbove100Percent() public {
+        vm.expectRevert(ZenoIndexVault.InvalidBps.selector);
+        zenoIndexVault.setMaxPriceChangeBps(10_001);
+
+        zenoIndexVault.setMaxPriceChangeBps(10_000);
+        assertEq(zenoIndexVault.maxPriceChangeBps(), 10_000);
+    }
+
     /// @dev #2: zero price rejected; one update can't move a price past maxPriceChangeBps.
     function test_SetPrice_RejectsZeroAndOversizedMove() public {
         vm.expectRevert(ZenoIndexVault.ZeroPrice.selector);
@@ -1472,6 +1480,60 @@ contract ZenoIndexVaultTest is Test {
         zenoIndexVault.setMaxPriceChangeBps(0);
         zenoIndexVault.setPriceWhole(address(tokenA), 500_000);
         assertEq(zenoIndexVault.valueUsdc(address(tokenA), 1e6), 500_000);
+    }
+
+    function test_SetPrice_RejectsChangeBeyondBoundWithSmallRationalPrices() public {
+        // Set an old price of 1/3 while the guard is deliberately disabled.
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        zenoIndexVault.setPrice(address(tokenA), 1, 3);
+
+        // Restore the 20% guard. A change from 1/3 to 3/7 is about 28.6%.
+        zenoIndexVault.setMaxPriceChangeBps(2_000);
+        vm.expectRevert(abi.encodeWithSelector(ZenoIndexVault.PriceChangeTooLarge.selector, address(tokenA)));
+        zenoIndexVault.setPrice(address(tokenA), 3, 7);
+    }
+
+    function test_SetPrice_AcceptsExactUpperAndLowerBoundaries() public {
+        // Start at 1/3 with the guard disabled.
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        zenoIndexVault.setPrice(address(tokenA), 1, 3);
+
+        // Exactly +20%: (1/3) * 1.2 = 2/5.
+        zenoIndexVault.setMaxPriceChangeBps(2_000);
+        zenoIndexVault.setPrice(address(tokenA), 2, 5);
+
+        assertEq(zenoIndexVault.priceNum(address(tokenA)), 2);
+        assertEq(zenoIndexVault.priceDen(address(tokenA)), 5);
+
+        // Reset to 1/3 with the guard disabled.
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        zenoIndexVault.setPrice(address(tokenA), 1, 3);
+
+        // Exactly -20%: (1/3) * 0.8 = 4/15.
+        zenoIndexVault.setMaxPriceChangeBps(2_000);
+        zenoIndexVault.setPrice(address(tokenA), 4, 15);
+
+        assertEq(zenoIndexVault.priceNum(address(tokenA)), 4);
+        assertEq(zenoIndexVault.priceDen(address(tokenA)), 15);
+    }
+
+    function test_SetPrice_RejectsExcessiveDownwardMoveWithSmallRationalPrices() public {
+        zenoIndexVault.setMaxPriceChangeBps(0);
+        zenoIndexVault.setPrice(address(tokenA), 1, 3);
+
+        zenoIndexVault.setMaxPriceChangeBps(2_000);
+        vm.expectRevert(abi.encodeWithSelector(ZenoIndexVault.PriceChangeTooLarge.selector, address(tokenA)));
+        // 1/3 -> 1/5 is a 40% decrease, beyond the 20% guard.
+        zenoIndexVault.setPrice(address(tokenA), 1, 5);
+    }
+
+    function test_SetPrice_LargeNumeratorAndDenominatorAvoidGuardOverflow() public {
+        uint256 large = type(uint256).max / 2;
+
+        zenoIndexVault.setPrice(address(tokenA), large, large);
+
+        assertEq(zenoIndexVault.priceNum(address(tokenA)), large);
+        assertEq(zenoIndexVault.priceDen(address(tokenA)), large);
     }
 
     /// @dev #2: a price older than maxPriceAge blocks NAV reads (and so deposits).

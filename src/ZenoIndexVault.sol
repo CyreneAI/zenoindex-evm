@@ -9,6 +9,7 @@ import {IAccessMaster} from "./interfaces/IAccessMaster.sol";
 import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 import {ERC20Minimal} from "./tokens/ERC20Minimal.sol";
 import {Constants} from "./libraries/Constants.sol";
+import {FullMath} from "v4-core/libraries/FullMath.sol";
 
 /// @notice Root contract: emergency flag, asset registry, NAV/valuation (formerly
 ///         NavCalculation.sol), swap execution (formerly SwapExecutor.sol), and the
@@ -214,6 +215,7 @@ contract ZenoIndexVault is IZenoIndexVault {
     }
 
     function setMaxPriceChangeBps(uint16 maxPriceChangeBps_) external onlySuperAdmin {
+        if (maxPriceChangeBps_ > Constants.BPS_DENOM) revert InvalidBps();
         maxPriceChangeBps = maxPriceChangeBps_;
         emit MaxPriceChangeBpsSet(maxPriceChangeBps_);
     }
@@ -509,15 +511,60 @@ contract ZenoIndexVault is IZenoIndexVault {
         uint256 oldDen = priceDen[token];
         uint256 bound = maxPriceChangeBps;
         if (bound != 0 && oldDen != 0) {
-            // Compare per-unit prices by cross-multiplying: new = usdcOut/tokenIn, old = oldNum/oldDen.
-            uint256 newScaled = usdcOut * oldDen;
-            uint256 oldScaled = oldNum * tokenIn;
-            uint256 diff = newScaled > oldScaled ? newScaled - oldScaled : oldScaled - newScaled;
-            if (diff * Constants.BPS_DENOM > oldScaled * bound) revert PriceChangeTooLarge(token);
+            uint256 bps = Constants.BPS_DENOM;
+
+            // Exact upper threshold: oldNum * (BPS + bound) / BPS.
+            uint256 upper = FullMath.mulDiv(oldNum, bps + bound, bps);
+            uint256 upperRem = mulmod(oldNum, bps + bound, bps);
+
+            // Exact lower threshold: oldNum * (BPS - bound) / BPS.
+            uint256 lower = FullMath.mulDiv(oldNum, bps - bound, bps);
+            uint256 lowerRem = mulmod(oldNum, bps - bound, bps);
+
+            // Represent new price in the old denominator as q + r/tokenIn.
+            uint256 q = FullMath.mulDiv(usdcOut, oldDen, tokenIn);
+            uint256 r = mulmod(usdcOut, oldDen, tokenIn);
+
+            bool tooHigh = q > upper || (q == upper && _fractionGreaterThan(r, tokenIn, upperRem, bps));
+
+            bool tooLow = q < lower || (q == lower && _fractionGreaterThan(lowerRem, bps, r, tokenIn));
+
+            if (tooHigh || tooLow) revert PriceChangeTooLarge(token);
         }
+
         priceNum[token] = usdcOut;
         priceDen[token] = tokenIn;
         priceUpdatedAt[token] = block.timestamp;
         emit PriceSet(token, usdcOut, tokenIn);
+    }
+
+    function _fractionGreaterThan(uint256 a, uint256 b, uint256 c, uint256 d) internal pure returns (bool result) {
+        result = false;
+        bool reverse = false;
+
+        while (true) {
+            uint256 q1 = a / b;
+            uint256 q2 = c / d;
+
+            if (q1 != q2) {
+                return reverse ? q1 < q2 : q1 > q2;
+            }
+
+            uint256 r1 = a % b;
+            uint256 r2 = c % d;
+
+            if (r1 == 0 || r2 == 0) {
+                if (r1 == 0 && r2 == 0) return false;
+
+                bool greater = r1 != 0;
+                return reverse ? !greater : greater;
+            }
+
+            a = b;
+            b = r1;
+            c = d;
+            d = r2;
+            reverse = !reverse;
+        }
     }
 }
