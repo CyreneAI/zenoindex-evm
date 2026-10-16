@@ -36,11 +36,29 @@ contract VaultLensForkTest is Test {
 
     function test_Fork_ZdiLensMatchesTotalNav() public {
         vm.skip(!forked);
-        VaultLens.VaultView memory lv = lens.getVault(zdi);
+        console2.log("block", block.number);
+        _checkVault(zdi);
+    }
+
+    /// @dev Every vault the factory has created, including demo vaults added after ZDI.
+    function test_Fork_AllFactoryVaultsLensMatchesTotalNav() public {
+        vm.skip(!forked);
+        uint64 n = ZenoIndexVault(FACTORY).totalVaults();
+        console2.log("block", block.number);
+        console2.log("factory vaults", uint256(n));
+        for (uint64 id = 0; id < n; id++) {
+            address vault = ZenoIndexVault(FACTORY).vaultClones(id);
+            console2.log("=== vault id", uint256(id), vault);
+            _checkVault(vault);
+        }
+    }
+
+    function _checkVault(address vault) internal view {
+        VaultLens.VaultView memory lv = lens.getVault(vault);
         assertEq(lv.factory, FACTORY);
         _log(lv);
 
-        try Vault(zdi).totalNav() returns (uint256 nav) {
+        try Vault(vault).totalNav() returns (uint256 nav) {
             assertTrue(lv.navComplete, "vault NAV readable => lens complete");
             assertEq(lv.totalNavUsdc, nav);
         } catch {
@@ -53,6 +71,7 @@ contract VaultLensForkTest is Test {
             sum += lv.assets[i].valueUsdc;
         }
         assertEq(sum, lv.totalNavUsdc, "parts sum to NAV");
+        assertEq(lv.aumUsdc, lv.totalNavUsdc + lv.redeemEscrowUsdc + lv.reservedValueUsdc, "AUM = NAV + owed to redeemers");
     }
 
     function _log(VaultLens.VaultView memory lv) internal pure {
