@@ -92,6 +92,7 @@ contract VaultLens {
         // ── AUM: everything the vault manages, including what it still owes redeemers.
         //    Written-off assets are excluded: they are no longer managed, only held until swept.
         uint256 aumUsdc; // totalNavUsdc + redeemEscrowUsdc + reservedValueUsdc
+        bool aumComplete; // navComplete, and every asset reserved for redeemers is freshly priced
         // ── Shares ──
         uint256 totalShares;
         uint256 navPerShare; // Constants.PRICE_SCALE units, like baselineSharePrice; 0 before genesis
@@ -111,6 +112,7 @@ contract VaultLens {
         v.redeemEscrowUsdc = vlt.vaultRedeemEscrowTotal();
         v.totalShares = vlt.totalShares();
         v.navComplete = true;
+        v.aumComplete = true;
 
         uint8 n = vlt.numAssets();
         v.assets = new AssetView[](n);
@@ -119,9 +121,12 @@ contract VaultLens {
             AssetView memory a = _slotView(vlt, f, v, i);
             if (a.mint == v.usdc) {
                 hasUsdcSlot = true;
-            } else if (a.freeAmount > 0 && a.priceStatus != PriceStatus.Fresh) {
+            } else if (a.priceStatus != PriceStatus.Fresh) {
                 // sumNav only quotes a non-USDC asset with a nonzero free balance.
-                v.navComplete = false;
+                if (a.freeAmount > 0) v.navComplete = false;
+                // AUM also values the reserved part, which NAV never quotes — a fully
+                // reserved asset with a stale or missing price leaves NAV complete but not AUM.
+                if (a.reserved > 0 && a.balance > 0) v.aumComplete = false;
             }
             v.assetsNavUsdc += a.valueUsdc;
             v.reservedValueUsdc += a.reservedValueUsdc;
@@ -137,6 +142,7 @@ contract VaultLens {
 
         v.totalNavUsdc = v.assetsNavUsdc + v.pendingUsdc;
         v.aumUsdc = v.totalNavUsdc + v.redeemEscrowUsdc + v.reservedValueUsdc;
+        v.aumComplete = v.aumComplete && v.navComplete;
         v.navPerShare = v.totalShares == 0 ? 0 : (v.totalNavUsdc * Constants.PRICE_SCALE) / v.totalShares;
 
         for (uint8 i = 0; i < n; i++) {

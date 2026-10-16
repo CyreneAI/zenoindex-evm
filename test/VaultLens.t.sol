@@ -125,6 +125,7 @@ contract VaultLensTest is Test {
 
         VaultLens.VaultView memory lv = lens.getVault(address(v));
         assertTrue(lv.navComplete);
+        assertTrue(lv.aumComplete);
         assertEq(lv.totalNavUsdc, v.totalNav());
         assertEq(lv.aumUsdc, lv.totalNavUsdc, "nothing owed to redeemers, so AUM == NAV");
         assertEq(lv.pendingUsdc, 0);
@@ -152,6 +153,7 @@ contract VaultLensTest is Test {
 
         VaultLens.VaultView memory lv = lens.getVault(address(v));
         assertFalse(lv.navComplete);
+        assertFalse(lv.aumComplete, "AUM incomplete whenever NAV is");
         assertEq(lv.totalNavUsdc, navBefore, "valued at the last stored price");
         assertEq(uint8(lv.assets[0].priceStatus), uint8(VaultLens.PriceStatus.Stale));
         assertEq(uint8(lv.assets[1].priceStatus), uint8(VaultLens.PriceStatus.Stale));
@@ -187,6 +189,7 @@ contract VaultLensTest is Test {
 
         VaultLens.VaultView memory lv = lens.getVault(address(v));
         assertFalse(lv.navComplete);
+        assertFalse(lv.aumComplete, "AUM incomplete whenever NAV is");
         assertEq(uint8(lv.assets[0].priceStatus), uint8(VaultLens.PriceStatus.Missing));
         assertEq(lv.assets[0].valueUsdc, 0);
         assertGt(lv.assets[0].freeAmount, 0);
@@ -207,6 +210,7 @@ contract VaultLensTest is Test {
 
         VaultLens.VaultView memory lv = lens.getVault(address(v));
         assertTrue(lv.navComplete);
+        assertTrue(lv.aumComplete, "reserved assets are freshly priced");
         assertEq(lv.totalNavUsdc, v.totalNav());
         assertGt(lv.redeemEscrowUsdc, 0);
         assertEq(lv.redeemEscrowUsdc, v.vaultRedeemEscrowTotal());
@@ -220,6 +224,75 @@ contract VaultLensTest is Test {
         assertEq(lv.aumUsdc, lv.totalNavUsdc + lv.redeemEscrowUsdc + lv.reservedValueUsdc);
         assertGt(lv.aumUsdc, lv.totalNavUsdc, "AUM includes what is owed to redeemers; NAV does not");
         _assertPartsSum(lv);
+    }
+
+    /// @dev Regression: A's whole balance is reserved for a redeemer and its price goes
+    ///      stale. NAV never quotes A (free = 0), so totalNav() works and NAV is complete,
+    ///      but AUM values the reserved A at a stale price and must say so.
+    function test_FullyReservedAssetWithStalePrice_NavCompleteButAumIncomplete() public {
+        Vault v = _vaultWithFullyReservedA();
+
+        vm.warp(block.timestamp + zenoIndexVault.maxPriceAge() + 1);
+        zenoIndexVault.setPriceWhole(address(tokenB), 1_000_000); // only A goes stale
+
+        VaultLens.VaultView memory lv = lens.getVault(address(v));
+        VaultLens.AssetView memory a = lv.assets[0];
+        assertEq(a.freeAmount, 0, "A fully reserved");
+        assertGt(a.reserved, 0);
+        assertEq(uint8(a.priceStatus), uint8(VaultLens.PriceStatus.Stale));
+
+        assertEq(lv.totalNavUsdc, v.totalNav(), "totalNav() does not revert: A is never quoted");
+        assertTrue(lv.navComplete);
+        assertFalse(lv.aumComplete, "reserved A is valued at a stale price");
+        assertGt(lv.reservedValueUsdc, 0, "still valued at the last stored price");
+    }
+
+    /// @dev Same as above with a missing price: reserved A drops to 0, so AUM is understated.
+    function test_FullyReservedAssetWithMissingPrice_AumIncompleteAndUnderstated() public {
+        Vault v = _vaultWithFullyReservedA();
+        uint256 aumBefore = lens.getVault(address(v)).aumUsdc;
+        vm.mockCall(
+            address(zenoIndexVault),
+            abi.encodeWithSignature("priceDen(address)", address(tokenA)),
+            abi.encode(uint256(0))
+        );
+
+        VaultLens.VaultView memory lv = lens.getVault(address(v));
+        assertEq(uint8(lv.assets[0].priceStatus), uint8(VaultLens.PriceStatus.Missing));
+        assertTrue(lv.navComplete);
+        assertFalse(lv.aumComplete);
+        assertLt(lv.aumUsdc, aumBefore, "AUM understated without A's price");
+    }
+
+    /// @dev user redeems half (reserving A), then the manager winds A down to 0% and sells
+    ///      all of A's free balance. Retirement is blocked by the open redeem, so A keeps
+    ///      its slot holding only the reserved amount.
+    function _vaultWithFullyReservedA() internal returns (Vault v) {
+        v = _vaultAB();
+        _genesis(v);
+        _depositAs(v, user, 100_000e6);
+        _deployBoth(v);
+
+        uint256 shares = ShareToken(v.sharesToken()).balanceOf(user) / 2;
+        vm.prank(user);
+        v.requestRedeem(shares);
+
+        uint64[] memory ids = new uint64[](1);
+        ids[0] = assetB;
+        uint16[] memory bps = new uint16[](1);
+        bps[0] = 10_000;
+        vm.startPrank(manager);
+        v.setTargetAllocations(ids, bps);
+        v.executeRebalance(0, _path(address(tokenA), address(usdc)), 0);
+        vm.stopPrank();
+
+        assertEq(v.assetIdAt(0), assetA, "A not retired while the redeem is open");
+        assertGt(v.reservedAt(0), 0);
+        assertEq(tokenA.balanceOf(address(v)), v.reservedAt(0), "only the reserved A is left");
+
+        VaultLens.VaultView memory lv = lens.getVault(address(v));
+        assertTrue(lv.navComplete);
+        assertTrue(lv.aumComplete, "fresh prices: complete");
     }
 
     // ── USDC handling ─────────────────────────────────────────────────────────
@@ -349,6 +422,7 @@ contract VaultLensTest is Test {
 
         VaultLens.VaultView memory lv = lens.getVault(address(v));
         assertTrue(lv.navComplete);
+        assertTrue(lv.aumComplete);
         assertEq(lv.totalNavUsdc, v.totalNav());
         _assertPartsSum(lv);
     }

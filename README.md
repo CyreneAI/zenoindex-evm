@@ -236,6 +236,7 @@ Key behaviors:
 - `navOf(vault)` is a non-reverting `Vault.totalNav()`: returns `(nav, complete)`.
 - It mirrors `ZenoIndexVault.sumNav` exactly. When `complete` is true, the lens NAV equals `Vault.totalNav()`. When a held asset's price is stale or missing, `totalNav()` reverts; the lens instead values that asset at its last stored price (0 if none) and reports `complete = false`.
 - **NAV** (`totalNavUsdc`) is the net asset value: what current shareholders own. **AUM** (`aumUsdc`) is the total value of assets the vault manages: NAV plus the USDC and reserved assets still owed to redeemers who have already burned their shares. The two are equal whenever no redemption is in flight. Written-off assets are in neither.
+- `aumComplete` is the AUM counterpart of `navComplete`. It is also false when an asset reserved for redeemers has a stale or missing price. NAV never values that reserved part, so NAV can be complete while AUM is not.
 - Current weights are measured against total NAV, with pending and unallocated USDC as their own rows, so all rows add up to 100% (less rounding).
 - Slot indices shift when a slot retires; key rows on `assetId`.
 

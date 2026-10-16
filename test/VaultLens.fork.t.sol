@@ -72,12 +72,14 @@ contract VaultLensForkTest is Test {
         }
         assertEq(sum, lv.totalNavUsdc, "parts sum to NAV");
         assertEq(lv.aumUsdc, lv.totalNavUsdc + lv.redeemEscrowUsdc + lv.reservedValueUsdc, "AUM = NAV + owed to redeemers");
+        if (lv.aumComplete) assertTrue(lv.navComplete, "AUM complete implies NAV complete");
     }
 
     function _log(VaultLens.VaultView memory lv) internal pure {
         console2.log("totalNavUsdc", lv.totalNavUsdc);
         console2.log("navComplete", lv.navComplete);
         console2.log("aumUsdc", lv.aumUsdc);
+        console2.log("aumComplete", lv.aumComplete);
         console2.log("pendingUsdc", lv.pendingUsdc);
         console2.log("unallocatedUsdc", lv.unallocatedUsdc);
         console2.log("redeemEscrowUsdc", lv.redeemEscrowUsdc);
