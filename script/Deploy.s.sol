@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {ZenoIndexVault} from "../src/ZenoIndexVault.sol";
 import {Vault} from "../src/Vault.sol";
 import {AccessMaster} from "../src/AccessMaster.sol";
+import {FeeEscrow} from "../src/FeeEscrow.sol";
 
 /// @notice Production deploy for the clone-factory ZenoIndexVault.
 ///         Deploys Vault impl + AccessMaster + ZenoIndexVault, then wires an existing
@@ -61,6 +62,8 @@ contract Deploy is Script {
 
         ZenoIndexVault zenoIndexVault =
             new ZenoIndexVault(stablecoin, address(vaultImpl), address(accessMaster));
+        FeeEscrow feeEscrow = new FeeEscrow(address(zenoIndexVault), address(accessMaster));
+        zenoIndexVault.setFeeEscrow(address(feeEscrow));
 
         _registerOptionalAssets(zenoIndexVault);
 
@@ -70,6 +73,8 @@ contract Deploy is Script {
         console2.log("ZenoIndexVault (factory):", address(zenoIndexVault));
         console2.log("Vault (impl):            ", address(vaultImpl));
         console2.log("AccessMaster:            ", address(accessMaster));
+        console2.log("FeeEscrow:               ", address(feeEscrow));
+        console2.log("feeEscrow configured:    ", zenoIndexVault.feeEscrow());
         console2.log("superAdmin:", zenoIndexVault.superAdmin());
         console2.log("treasury:  ", zenoIndexVault.treasury());
         console2.log("usdcToken: ", zenoIndexVault.usdcToken());

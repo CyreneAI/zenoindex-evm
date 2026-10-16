@@ -243,7 +243,7 @@ Key behaviors:
 
 ### 1. Deploy and configure
 
-The core deployment script deploys the `Vault` implementation, `AccessMaster`, and `ZenoIndexVault`. The swap adapter and router configuration are separate steps. Before creating a vault, the factory needs a router and each non-stablecoin asset used by the basket needs a configured price.
+The core deployment script deploys the `Vault` implementation, `AccessMaster`, `ZenoIndexVault`, and a `FeeEscrow` linked to that factory, then registers the escrow through `setFeeEscrow`. The swap adapter and router configuration are separate steps. Before creating a vault, the factory needs a router and each non-stablecoin asset used by the basket needs a configured price.
 
 ### 2. Create a vault
 
@@ -509,7 +509,7 @@ The current `foundry.toml` maps the `robinhood_testnet` and `robinhood` RPC alia
 
 | Script | Purpose | Important limitation |
 |---|---|---|
-| `script/Deploy.s.sol` | Deploys a new `Vault` implementation, `AccessMaster`, and `ZenoIndexVault`; optionally registers assets from environment variables. | Does not deploy or configure the Uniswap V4 adapter or set the factory router. |
+| `script/Deploy.s.sol` | Deploys a new `Vault` implementation, `AccessMaster`, `ZenoIndexVault`, and factory-linked `FeeEscrow`; configures the escrow and optionally registers assets from environment variables. | Does not deploy or configure the Uniswap V4 adapter or set the factory router. |
 | `script/DeployUniswapV4Adapter.s.sol` | Deploys an adapter for the addresses and parameters defined in that script. | Inspect its hardcoded addresses and assumptions before use. |
 | `script/ConfigureUniswapV4Adapter.s.sol` | Configures an existing adapter using `ADAPTER_ADDRESS`. | Requires an adapter already deployed on the target chain and a factory router that is still unset. |
 | `script/DeployAndConfigureUniswapV4Adapter.s.sol` | Deploys the adapter and configures factory authorization, a pool, and the factory router in one script. | Contains hardcoded mainnet addresses and assumed USDG/NVDA pool parameters. It is not a generic testnet script. |

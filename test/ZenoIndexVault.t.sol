@@ -92,7 +92,6 @@ contract ZenoIndexVaultTest is Test {
         assertEq(zenoIndexVault.feeEscrow(), address(replacement));
     }
 
-
     function test_SetFeeEscrow_OldEscrowClaimsRemainAvailable() public {
         Vault v = _createDirectVault(100, 50, 0);
         _genesis(v, 1_000_000_000);
@@ -128,7 +127,6 @@ contract ZenoIndexVaultTest is Test {
         assertEq(usdc.balanceOf(feeRecipient), expectedManagerFee);
         assertEq(oldEscrow.totalClaimable(address(usdc)), 0);
     }
-
 
     function test_SetFeeEscrow_RevertsForUnauthorizedCaller() public {
         vm.prank(user);
@@ -456,6 +454,72 @@ contract ZenoIndexVaultTest is Test {
         v.swapUsdcToAsset(0, pathA, 0);
         v.swapUsdcToAsset(1, pathB, 0);
         vm.stopPrank();
+    }
+
+    function test_ExecuteRebalance_TradingFeeSplitsBetweenPlatformAndManager() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        accessMaster.setTradingFeeBps(100);
+
+        uint64[] memory assetIds = new uint64[](2);
+        assetIds[0] = assetA;
+        assetIds[1] = assetB;
+
+        uint16[] memory allocations = new uint16[](2);
+        allocations[0] = 3000;
+        allocations[1] = 7000;
+
+        vm.prank(manager);
+        v.setTargetAllocations(assetIds, allocations);
+
+        address[] memory sellPath = new address[](2);
+        sellPath[0] = address(tokenA);
+        sellPath[1] = address(usdc);
+
+        uint256 platformBefore = feeEscrow.platformClaimable(address(usdc));
+        uint256 managerBefore = feeEscrow.managerClaimable(manager, address(usdc));
+        uint256 totalBefore = feeEscrow.totalClaimable(address(usdc));
+
+        vm.prank(manager);
+        v.executeRebalance(0, sellPath, 0);
+
+        uint256 platformDelta = feeEscrow.platformClaimable(address(usdc)) - platformBefore;
+        uint256 managerDelta = feeEscrow.managerClaimable(manager, address(usdc)) - managerBefore;
+        uint256 totalDelta = feeEscrow.totalClaimable(address(usdc)) - totalBefore;
+
+        assertGt(totalDelta, 0);
+        assertEq(platformDelta, totalDelta * 2000 / 10000);
+        assertEq(managerDelta, totalDelta - platformDelta);
+    }
+
+    function test_ExecuteRebalance_ZeroTradingFeeCollectsNothing() public {
+        Vault v = _createDirectVault(0, 50, 0);
+        _genesis(v, 1_000_000_000);
+        _deployBoth(v);
+
+        accessMaster.setTradingFeeBps(0);
+
+        uint64[] memory assetIds = new uint64[](2);
+        assetIds[0] = assetA;
+        assetIds[1] = assetB;
+
+        uint16[] memory allocations = new uint16[](2);
+        allocations[0] = 3000;
+        allocations[1] = 7000;
+
+        vm.prank(manager);
+        v.setTargetAllocations(assetIds, allocations);
+
+        address[] memory sellPath = new address[](2);
+        sellPath[0] = address(tokenA);
+        sellPath[1] = address(usdc);
+
+        vm.prank(manager);
+        v.executeRebalance(0, sellPath, 0);
+
+        assertEq(feeEscrow.totalClaimable(address(usdc)), 0);
     }
 
     function test_ExecuteRebalance_OverweightSellChangesBalances() public {

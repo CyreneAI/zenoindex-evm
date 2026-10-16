@@ -15,6 +15,30 @@ contract AccessMasterTest is Test {
     address internal treasury0 = address(0x7EA5);
     address internal treasury1 = address(0x7EA1);
 
+    function test_TradingFeeBps_DefaultsToZero() public view {
+        assertEq(accessMaster.tradingFeeBps(), 0);
+    }
+
+    function test_SetTradingFeeBps_UpdatesAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit AccessMaster.TradingFeeUpdated(100);
+
+        accessMaster.setTradingFeeBps(100);
+
+        assertEq(accessMaster.tradingFeeBps(), 100);
+    }
+
+    function test_SetTradingFeeBps_RevertsAboveMaximum() public {
+        vm.expectRevert(AccessMaster.TradingFeeOutOfBounds.selector);
+        accessMaster.setTradingFeeBps(201);
+    }
+
+    function test_SetTradingFeeBps_RevertsForNonAdmin() public {
+        vm.prank(stranger);
+        vm.expectRevert();
+        accessMaster.setTradingFeeBps(100);
+    }
+
     function setUp() public {
         accessMaster = new AccessMaster(admin, treasury0);
     }

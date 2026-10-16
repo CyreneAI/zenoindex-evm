@@ -6,6 +6,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IZenoIndexVault} from "./interfaces/IZenoIndexVault.sol";
+import {IAccessMaster} from "./interfaces/IAccessMaster.sol";
 import {IVault} from "./interfaces/IVault.sol";
 import {ERC20Minimal} from "./tokens/ERC20Minimal.sol";
 import {ShareToken} from "./tokens/ShareToken.sol";
@@ -548,7 +549,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             // redeployed by buying other slots).
             if (mint != usdc && free > 0 && _value(mint, free, usdc) > Constants.RETIRE_DUST_USDC) {
                 _requirePath(path, mint, usdc);
-                _swap(path, free, minOut);
+                _swapForRebalance(path, free, minOut);
                 emit RebalanceExecuted(assetIndex, free, true);
             }
         } else {
@@ -697,7 +698,7 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             uint256 sellAmount = currentValueUsdc == 0 ? 0 : (free * deltaValueUsdc) / currentValueUsdc;
             if (sellAmount == 0) return;
             _requirePath(path, mint, usdc);
-            _swap(path, sellAmount, minOut);
+            _swapForRebalance(path, sellAmount, minOut);
             emit RebalanceExecuted(assetIndex, sellAmount, true);
         } else {
             // Underweight: buy the delta, funded only from USDC that isn't already earmarked
@@ -711,9 +712,26 @@ contract Vault is Initializable, ReentrancyGuard, IVault {
             uint256 buyAmount = deltaValueUsdc < usdcFree ? deltaValueUsdc : usdcFree;
             if (buyAmount == 0) return;
             _requirePath(path, usdc, mint);
-            _swap(path, buyAmount, minOut);
+            _swapForRebalance(path, buyAmount, minOut);
             emit RebalanceExecuted(assetIndex, buyAmount, false);
         }
+    }
+
+    /// @dev Executes a rebalance swap and accounts the configured fee on its output token.
+    function _swapForRebalance(address[] calldata path, uint256 amountIn, uint256 minOut)
+        internal
+        returns (uint256 received)
+    {
+        received = _swap(path, amountIn, minOut);
+
+        uint16 feeBps = IAccessMaster(IZenoIndexVault(zenoIndexVault).accessMaster()).tradingFeeBps();
+
+        if (feeBps == 0 || received == 0) return received;
+
+        VaultMath.FeeSplit memory fee = VaultMath.computeFeeSplit(received, feeBps);
+        _payFees(path[path.length - 1], fee, IFeeEscrowAccount.FeeType.Trading);
+
+        return received;
     }
 
     /// @dev Approves the router for exactly `amountIn`, swaps via ZenoIndexVault, resets the
