@@ -1,3 +1,4 @@
+
 # ZenoIndex EVM
 
 ZenoIndex is an EVM smart-contract system for creating and operating index-style vaults. Authorized creators launch vaults, investors deposit the configured stablecoin and receive vault shares, and vault managers manage allocations, swaps, rebalancing, and redemptions.
@@ -5,7 +6,7 @@ ZenoIndex is an EVM smart-contract system for creating and operating index-style
 This repository contains the on-chain contracts and Foundry scripts. It is one part of the wider Zeno product: the mobile app and hosted Zeno backend are separate projects and integrate with these contracts through their own interfaces and API layers.
 
 > [!IMPORTANT]
-> **Passing tests or a fork simulation does not mean mainnet is production-ready.** The current Uniswap V4 adapter scripts assume a USDG/NVDA pool configuration. Verify the actual pool key, initialization, hooks, liquidity, prices, addresses, signer, and chain before broadcasting transactions. Never use unverified configuration with real funds.
+> **Mainnet deployment is complete for the contracts listed in this README. Do not rerun deployment or router-configuration scripts against this deployment.** The full live vault flow (deposit, swap/rebalance, and redemption) has not yet been confirmed end to end. Price updates currently use Uniswap V4 `slot0` spot prices, not a TWAP. Passing tests does not mean the system is audited or production-ready.
 
 ## Contents
 
@@ -202,424 +203,450 @@ The following files define interfaces or test helpers:
 
 | File | Purpose |
 |---|---|
-| `IAccessMaster.sol` | Interface for shared role and treasury information. |
-| `ISwapRouter.sol` | Interface used to execute swaps through a router. |
-| `IVault.sol` | Interface for vault initialization and factory-to-vault calls. |
-| `IZenoIndexVault.sol` | Interface for vault-to-factory operations such as NAV and swap execution. |
-| `MockERC20.sol` | Test ERC-20 token used in unit tests. |
-| `MockSwapRouter.sol` | Mock router used to test vault swap behavior without relying on a live pool. |
-| `Constants.sol` | Protocol constants and bounds. |
-| `ERC20Minimal.sol` | Minimal ERC-20 base used by the project. |
-| `ShareToken.sol` | Vault-owned six-decimal ERC-20 share token. |
-
-Mocks are testing utilities, not production contracts.
-
-### `FeeEscrow.sol`
-
-**What it does:** Holds and accounts for accrued platform and vault-manager fees across vault clones.
-
-Key behaviors:
-
-- Only registered vault clones can account for fees.
-- The vault transfers fee tokens to the escrow and supplies the fee split calculated by `VaultMath`.
-- The current fee split allocates 20% of the fee amount to the platform and 80% to the vault manager.
-- Managers claim their accumulated fees using `claimManagerFees`.
-- The configured treasury claims platform fees using `claimPlatformFees`.
-- `totalClaimable` tracks accrued liabilities by token, and accounting checks that the escrow balance covers those liabilities.
-- `FeeType` defines Deposit, Redemption, and Trading categories. Trading-fee collection is not yet integrated into the vault flow.
+| `IAccessMaster.sol` | Interface for shared role and treasury access. |
+| `ISwapRouter.sol` | Interface for the swap-router implementation. |
+| `IVault.sol` | Interface for vault operations. |
+| `IZenoIndexVault.sol` | Interface for factory operations used by vaults. |
+| `MockERC20.sol` | ERC-20 mock used in tests. |
+| `MockSwapRouter.sol` | Swap-router mock used in tests. |
+| `ERC20Minimal.sol` | Minimal ERC-20 implementation used by the project. |
+| `ShareToken.sol` | ERC-20 share token associated with a vault. |
 
 ## Protocol lifecycle
 
-### 1. Deploy and configure
+### 1. Factory setup
 
-The core deployment script deploys the `Vault` implementation, `AccessMaster`, `ZenoIndexVault`, and a `FeeEscrow` linked to that factory, then registers the escrow through `setFeeEscrow`. The swap adapter and router configuration are separate steps. Before creating a vault, the factory needs a router and each non-stablecoin asset used by the basket needs a configured price.
+The deployer configures the factory with the vault implementation, shared access contract, stablecoin, router, and fee escrow. Assets must be registered before they can be used in a vault.
 
-### 2. Create a vault
+### 2. Vault creation
 
-The super-admin or an account allowlisted with `setVaultCreator` calls `ZenoIndexVault.createVault`. The factory clones the `Vault` implementation and initializes the clone. Initialization defines the manager, fee recipient, asset IDs, and target allocation basis points, subject to contract validation.
+An authorized creator calls `createVault` with the required vault configuration. The factory creates a clone and initializes it with the supplied parameters.
 
-### 3. Seed the vault
+### 3. Genesis deposit
 
-The vault manager calls `genesisDeposit` to seed the vault according to the genesis rules. This is separate from normal investor deposits.
+The manager makes the initial deposit required by the vault's initialization and share-supply rules. The exact amount and permitted timing depend on the current contract implementation.
 
-### 4. Deposit and issue shares
+### 4. Investor deposits
 
-An investor calls `deposit` with the configured stablecoin. The vault calculates NAV and shares to mint, applies the configured fee and share-cap rules, receives the deposit, pays fees, mints shares, and records pending allocation targets. `previewDeposit` uses the shared quote logic so its result follows the deposit calculation.
+Investors deposit the configured stablecoin and receive shares based on the vault's NAV and fee rules. Deposits can be affected by price freshness, share caps, allocation constraints, and other validation checks.
 
-### 5. Buy assets and rebalance
+### 5. Asset swaps and rebalancing
 
-The vault manager can call `swapUsdcToAsset` and `executeRebalance`. The vault calls `ZenoIndexVault.executeSwap`; the factory restricts this entry point to registered vault clones and enforces a minimum output based on the configured price table and slippage setting. The factory then calls the configured `ISwapRouter`.
+The vault requests swaps through the factory. The factory validates the request and forwards it to the configured adapter. The adapter uses registered Uniswap V4 pool configurations to execute supported swaps.
 
-For Uniswap V4, the adapter uses explicitly registered pool keys. Registering a token in the factory does **not** mean that a usable swap route exists. Each required pool must have the correct currency ordering, fee, tick spacing, hook address, initialization state, and usable liquidity.
+### 6. Redemption
 
-### 6. Redeem and claim
+An investor requests redemption. The vault applies the configured redemption rules and handles the corresponding share accounting. Stablecoin proceeds can be claimed after the required settlement steps, subject to available liquidity and the current contract state.
 
-An investor calls `requestRedeem`, which burns shares and accounts for the corresponding redemption legs. Asset legs may need to be swapped to the stablecoin before `claim` can pay proceeds. The vault also supports `claimInKind` and a timeout-based `forceSettleRedeem` path. Exact permissions, timing, and pause/emergency behavior are enforced by the contracts.
+### 7. Recovery and emergency operations
 
-### 7. Operate and recover
-
-Managers can change target allocations and rebalance. The code includes proposal/confirmation flows for writing off and reactivating assets, and a super-admin sweep path for written-off balances. Emergency and pause controls restrict specified operations while supported exit/recovery paths remain available.
+The contracts include emergency and recovery paths, including supported in-kind redemption and write-off flows. These paths have their own conditions and permissions. They should be tested against the actual deployment before being relied upon during an incident.
 
 ## Roles and permissions
 
-| Role | What it can do |
-|---|---|
-| **Super-admin** | Controls factory configuration, prices and safety parameters, asset activation, creator allowlisting, per-vault operator permissions, emergency controls, and administrative recovery actions. The source of truth is `AccessMaster`. |
-| **Global operator** | Has operator-level access to supported asset-registry operations. This role does not automatically grant manager permissions on every vault. |
-| **Vault creator** | An account allowlisted by the super-admin to call `createVault`. The super-admin can also create vaults. |
-| **Vault manager** | The configured manager, plus any account explicitly authorized for that specific vault through the factory. Can perform manager-gated operations such as swaps, allocation updates, and rebalancing. |
-| **Investor** | Deposits the configured stablecoin, receives vault shares, and uses supported redemption and claim/exit paths. |
+The exact permissions are defined by the current contract source. In general:
 
-Super-admin transfer in `AccessMaster` is two-step: the current admin proposes a new address, and the proposed address accepts. The contract prevents inherited OpenZeppelin role-management functions from independently granting or revoking the admin role. Vault operator permissions are scoped per vault.
+| Role | Responsibility |
+|---|---|
+| Super-admin | Performs privileged factory and system administration. |
+| Global operator | Performs operations explicitly permitted by the contracts. |
+| Vault manager | Manages a vault's supported portfolio and lifecycle operations. |
+| Vault creator | Creates vaults when authorized by the factory. |
+| Investor | Deposits stablecoin, holds shares, and uses supported redemption flows. |
+| Treasury | Receives fees or other configured transfers where applicable. |
+
+Do not assume a role has permission merely because its name suggests it. Check the relevant modifier and role check before calling privileged functions.
 
 ## Assets, pricing, and swaps
 
-### Stablecoin configuration
+### Asset registration
 
-The factory's `usdcToken` field is the configured deposit/accounting stablecoin. Despite the variable name, `script/Deploy.s.sol` accepts either USDC or USDG through `STABLECOIN`. A factory instance has one configured stablecoin; this does not mean USDC and USDG are both accepted by the same instance.
+Assets must be registered with the factory before they can be used in a vault. Each asset is represented by its registered asset ID. The factory's configured stablecoin occupies the stablecoin slot.
 
-The project's mainnet review documents a stablecoin slot in every production vault basket as an operational convention. Confirm the exact asset IDs and allocations for each vault.
+### Price updates
 
-### Asset registration versus investment support
+The factory maintains prices used for NAV and other price-dependent operations. Price updates are subject to the contract's validation rules, including configured movement and freshness constraints.
 
-For an asset to be usable in a production vault, verify all applicable items:
+The current `UpdatePricesFromV4.s.sol` script reads Uniswap V4 `slot0` spot state for configured pools and submits prices to the factory. A spot price is not a time-weighted average price (TWAP), and the update script does not by itself provide manipulation-resistant oracle security.
 
-1. The correct ERC-20 token address is registered in `ZenoIndexVault`.
-2. A valid price is configured for each non-stablecoin asset.
-3. The adapter has the correct V4 pool key for every required swap hop.
-4. Each pool is initialized and has sufficient liquidity for the intended trade.
-5. Any nonzero hook address is allowed by the adapter and has been reviewed.
-6. The factory's router is configured, and the adapter authorizes the factory as a caller.
-7. The expected trade size, price impact, and minimum output are acceptable.
+### Swaps
 
-An asset registry entry, a price entry, or an adapter pool registration by itself does not guarantee successful or economically safe swaps. Do not describe an asset as production-supported until the full path has been verified.
+The factory forwards authorized swap requests to the configured adapter. The adapter must have the correct PoolManager, caller authorization, and registered pool configuration.
 
-### Price table and NAV
+Before a swap is attempted, verify:
 
-`ZenoIndexVault` values the configured stablecoin at 1:1 and values other assets using the admin-maintained price table. Prices are managed through `setPrice` / `setPriceWhole`; check the function implementation and script for the units expected by a particular call.
+- The exact token pair and pool key.
+- The pool's initialization state.
+- Hook configuration and any applicable hook restrictions.
+- Current liquidity and expected price impact for the intended trade size.
+- The minimum acceptable output.
+- The adapter's authorization and the factory's router configuration.
 
-The code's documented defaults include:
-
-- Maximum price age: **1 day**
-- Maximum single price move: **20%**
-- Maximum swap slippage setting: **3%**
-
-The super-admin can configure these limits. Missing or stale prices can block operations that depend on NAV. The price table is an administrative input, not an on-chain market oracle, so production requires a trusted and monitored price-update process.
-
-### Swap protections
-
-- The factory's `executeSwap` is restricted to registered vault clones.
-- The factory requires `from` to equal the calling vault clone.
-- The factory raises the requested minimum output to its price-table-based slippage floor.
-- The adapter restricts `swap` to authorized callers.
-- The adapter restricts `unlockCallback` to the configured V4 `PoolManager`.
-- Pool registration includes the currencies, fee, tick spacing, and hook address.
-
-These checks do not eliminate market, liquidity, pricing, or administrative-key risk. Fee-on-transfer and rebasing tokens are unsupported by the current design.
+A registered pool ID is not proof that a trade will succeed or receive a reasonable execution price.
 
 ## Redemptions and recovery
 
-- **`requestRedeem`** burns shares and accounts for the redemption legs. It reverts if all legs round to zero.
-- **`claim`** pays the stablecoin proceeds once required swap legs have been completed.
-- **`claimInKind`** closes a redemption by paying unswapped legs in the corresponding assets, plus any escrowed stablecoin, subject to token transfer success.
-- **`forceSettleRedeem(user)`** provides an in-kind settlement path after the configured timeout, documented in the code as seven days.
-- **Rebalancing** trades toward target allocations. A zero-target asset is wound down and its slot may be retired when the required conditions are met; active redemptions can prevent retirement.
-- **Write-off/reactivation** uses a manager proposal and super-admin confirmation. The configured stablecoin cannot be written off through the normal asset write-off path.
-- **Emergency/pause behavior** is function-specific. Do not assume that every function is disabled or every exit remains possible; inspect the implementation and tests for precise behavior.
+Redemption operations depend on the vault's available assets, required swap legs, share accounting, and configured settlement conditions.
+
+The contract includes supported stablecoin-claim and in-kind recovery paths. Timeout-based settlement also has specific conditions. Review the current `Vault.sol` implementation and tests before integrating with these flows.
+
+Do not treat the presence of a recovery function as a guarantee that every redemption can be completed under every market or emergency condition.
 
 ## Repository structure
+
+The main source and script directories are organized as follows:
 
 ```text
 .
 ├── src/
-│   ├── ZenoIndexVault.sol
-│   ├── Vault.sol
-│   ├── AccessMaster.sol
 │   ├── adapters/
 │   │   └── UniswapV4Adapter.sol
 │   ├── interfaces/
+│   │   ├── IAccessMaster.sol
+│   │   ├── ISwapRouter.sol
+│   │   ├── IVault.sol
+│   │   └── IZenoIndexVault.sol
 │   ├── libraries/
 │   │   ├── Constants.sol
 │   │   └── VaultMath.sol
-│   ├── mocks/
-│   └── tokens/
+│   ├── AccessMaster.sol
+│   ├── ERC20Minimal.sol
+│   ├── ShareToken.sol
+│   ├── Vault.sol
+│   └── ZenoIndexVault.sol
 ├── script/
-│   ├── Deploy.s.sol
-│   ├── DeployUniswapV4Adapter.s.sol
+│   ├── CheckRegisteredPools.s.sol
 │   ├── ConfigureUniswapV4Adapter.s.sol
+│   ├── Deploy.s.sol
 │   ├── DeployAndConfigureUniswapV4Adapter.s.sol
-│   └── check-readme-src-docs.sh
+│   ├── DeployUniswapV4Adapter.s.sol
+│   └── UpdatePricesFromV4.s.sol
 ├── test/
+│   └── ZenoIndexVault.t.sol
 ├── docs/
 │   └── MAINNET_REVIEW.md
-├── .env.example
-├── .gitignore
-├── .gitmodules
 ├── foundry.toml
-├── LICENSE
 └── README.md
 ```
 
-This tree highlights the main files; inspect the repository for the complete test and dependency layout.
+The tree above highlights the principal contracts and scripts. Consult the repository for the complete list of files, tests, libraries, and dependencies.
 
 ## Requirements
 
-- Git
-- [Foundry](https://book.getfoundry.sh/) (`forge`, `cast`, and optionally `anvil`)
-- Initialized Git submodules/dependencies
-- An RPC endpoint for fork testing or deployment
-- A funded account only when sending real transactions
+Install the following tools before building or testing:
 
-The project pins Solidity `0.8.26`, uses the Cancun EVM target, optimizer, and `via_ir` in `foundry.toml`. Use the repository's compiler settings instead of changing them ad hoc.
+- Git
+- Foundry (`forge`, `cast`, and `anvil`)
+- An RPC endpoint for the network you intend to use
+- A funded account only if you intend to broadcast transactions
+
+Check the installed versions:
+
+```bash
+git --version
+forge --version
+cast --version
+```
+
+Never place a private key directly in a command that may be saved in shell history or shared in logs.
 
 ## Clone and build
+
+Clone the repository and initialize submodules:
 
 ```bash
 git clone https://github.com/CyreneAI/zenoindex-evm.git
 cd zenoindex-evm
-
 git submodule update --init --recursive
+```
+
+Build the contracts:
+
+```bash
 forge build
 ```
 
-If the repository is already cloned, run commands from its root. If the build fails, check that Foundry is installed and that submodules and remappings are present before changing contract code.
-
-## Testing and development commands
-
-### Run all tests
-
-```bash
-forge test --summary
-```
-
-A previous run on the reviewed branch reported **221 passing tests, 0 failures, and 0 skipped tests** across `AccessMasterTest`, `AuditPoC`, `UniswapV4AdapterTest`, `VaultMathTest`, and `ZenoIndexVaultTest`. Re-run tests on the current checkout before relying on that number.
-
-### Run a specific test file
-
-```bash
-forge test --match-path test/ZenoIndexVault.t.sol -vv
-forge test --match-path test/UniswapV4Adapter.t.sol -vv
-```
-
-Use the exact file names present in `test/` if they differ in your checkout.
-
-### Run PoC regression tests
-
-```bash
-forge test --match-test 'test_PoC' -vv
-```
-
-### Run coverage
-
-```bash
-forge coverage --ir-minimum --report summary
-```
-
-### Check Solidity formatting
+Check formatting:
 
 ```bash
 forge fmt --check
 ```
 
-To apply formatting rather than just check it:
+## Testing and development commands
+
+Run the full test suite:
 
 ```bash
-forge fmt
+forge test
 ```
 
-Review the diff after formatting.
-
-### Check documentation coverage
+Run tests with a summary:
 
 ```bash
+forge test --summary
+```
+
+Run a specific test file:
+
+```bash
+forge test --match-path test/ZenoIndexVault.t.sol
+```
+
+Run tests matching a test name:
+
+```bash
+forge test --match-test testName
+```
+
+Generate coverage information:
+
+```bash
+forge coverage
+```
+
+The latest recorded test run for the deployment branch passed **259 tests, with 0 failures and 0 skipped tests**. Test results are tied to the tested code revision and do not establish that a live deployment has completed every end-to-end flow.
+
+Before committing changes, run:
+
+```bash
+forge fmt --check
+forge build
+forge test --summary
+git diff --check
 bash script/check-readme-src-docs.sh
 ```
 
-### Start a local development chain
-
-```bash
-anvil
-```
-
-Anvil is a local development chain. It is not Robinhood Chain testnet or mainnet.
-
-**What tests prove:** tests and fork simulations validate the states represented by the test environment. They do not independently prove live pool initialization/liquidity, production price correctness, or readiness for real user deposits.
-
 ## Environment configuration
 
-Start with the checked-in example:
+Use environment variables for RPC URLs, private keys, contract addresses, and other deployment settings. Keep secrets in a local `.env` file that is excluded from version control.
+
+Example configuration:
 
 ```bash
-cp .env.example .env
+# Network
+RH_RPC_URL=https://rpc.mainnet.chain.robinhood.com
+
+# Deployment account
+PRIVATE_KEY=
+
+# Existing deployed contracts
+FACTORY_ADDRESS=0x494EcBd1d8df35fb39aD5973Ec0A1598ADF26eA9
+ACCESS_MASTER=0xC3A8aB91f9CC66d789B33FD61674991aDEF3EdF2
+VAULT_IMPLEMENTATION=0xb78A139e2f316527a53673b5F093ceE9566CD1A7
+FEE_ESCROW=0x86867a40Da338dfaF75B8fB1f65bC3cc9Ca3b34F
+ADAPTER_ADDRESS=0x1CD3F47e7137761e4c1066273893fbE778BB2Dd7
+POOL_MANAGER=0x8366a39CC670B4001A1121B8F6A443A643e40951
 ```
 
-The `.env.example` file is the source of truth for variables consumed by the current scripts. The documented variables include:
+This is an illustrative environment template. Individual scripts may require additional variables or use different variable names. Inspect the script before running it.
 
-| Variable | Purpose |
-|---|---|
-| `PRIVATE_KEY` | Private key for deployment transactions. Keep it secret. |
-| `RH_RPC_URL` | RPC endpoint; the example defaults to Robinhood Chain testnet. |
-| `STABLECOIN` | Address of the configured USDC or USDG token for `Deploy.s.sol`. |
-| `TREASURY` | Optional fee treasury; defaults to the deployer if unset in `Deploy.s.sol`. |
-| `ASSET_0` … `ASSET_4` | Optional token addresses to register during core deployment. |
-| `ASSET_0_PRICE` … `ASSET_4_PRICE` | Optional prices for the corresponding assets, passed to `setPriceWhole`. |
-
-Price values must use the units expected by `setPriceWhole`; verify those units in the implementation before entering values. Do not copy placeholder addresses or prices into a live deployment.
-
-For Bash or Git Bash, load the environment file with:
-
-```bash
-set -a
-source .env
-set +a
-```
-
-Never commit `.env`, paste a private key into chat, or print secrets in logs. Confirm `.gitignore` protects the file before proceeding.
+Do not commit `.env`, private keys, seed phrases, or other secrets. Never paste a private key into chat.
 
 ## Network details
 
-The repository's Foundry configuration documents these Robinhood Chain networks:
+### Robinhood Chain mainnet
 
-| Network | Chain ID | RPC URL |
-|---|---:|---|
-| Robinhood Chain testnet | `46630` | `https://rpc.testnet.chain.robinhood.com` |
-| Robinhood Chain mainnet | `4663` | `https://rpc.mainnet.chain.robinhood.com` |
+| Setting | Value |
+|---|---|
+| Network | Robinhood Chain mainnet |
+| Chain ID | `4663` |
+| RPC URL | `https://rpc.mainnet.chain.robinhood.com` |
+| Configured stablecoin | USDG |
+| Stablecoin decimals | `6` |
 
-The current `foundry.toml` maps the `robinhood_testnet` and `robinhood` RPC aliases to `RH_RPC_URL`. Set that variable to the intended network endpoint before using either alias. Verify current RPC availability and chain ID before deployment.
+Verify the chain ID before any transaction:
+
+```bash
+cast chain-id --rpc-url "$RH_RPC_URL"
+```
+
+The result should be `4663` for the deployment documented below.
+
+Do not broadcast transactions if the chain ID, RPC endpoint, target addresses, or expected contract state does not match the intended environment.
 
 ## Deployment guide
 
-> [!CAUTION]
-> Deployment and configuration transactions change on-chain state. Review every address, chain ID, signer, token, pool parameter, and expected transaction before adding `--broadcast`. A fork simulation is not a mainnet deployment.
+> [!WARNING]
+> The contracts described in the mainnet section below have already been deployed. The following commands are for understanding the deployment workflow or using an explicitly approved separate environment. **Do not rerun deployment scripts against mainnet simply to reproduce the existing deployment.**
 
-### Understand the deployment scripts first
+### 1. Inspect the deployment script
 
-| Script | Purpose | Important limitation |
-|---|---|---|
-| `script/Deploy.s.sol` | Deploys a new `Vault` implementation, `AccessMaster`, `ZenoIndexVault`, and factory-linked `FeeEscrow`; configures the escrow and optionally registers assets from environment variables. | Does not deploy or configure the Uniswap V4 adapter or set the factory router. |
-| `script/DeployUniswapV4Adapter.s.sol` | Deploys an adapter for the addresses and parameters defined in that script. | Inspect its hardcoded addresses and assumptions before use. |
-| `script/ConfigureUniswapV4Adapter.s.sol` | Configures an existing adapter using `ADAPTER_ADDRESS`. | Requires an adapter already deployed on the target chain and a factory router that is still unset. |
-| `script/DeployAndConfigureUniswapV4Adapter.s.sol` | Deploys the adapter and configures factory authorization, a pool, and the factory router in one script. | Contains hardcoded mainnet addresses and assumed USDG/NVDA pool parameters. It is not a generic testnet script. |
+Review the current script before executing it:
 
-### 1. Prepare the core deployment
+```bash
+sed -n '1,240p' script/Deploy.s.sol
+```
 
-Set `PRIVATE_KEY`, `RH_RPC_URL`, and `STABLECOIN` in `.env`. Set `TREASURY` if the treasury should differ from the deployer. Optional `ASSET_n` and `ASSET_n_PRICE` variables can register assets and price them during core deployment.
+Confirm the expected environment variables, constructor parameters, registered assets, access roles, and network guards.
 
-Before sending transactions, verify:
+### 2. Simulate before broadcasting
 
-- The selected chain ID matches the RPC endpoint.
-- The stablecoin address is correct for that network.
-- The signer is the intended deployer and has sufficient native token for gas.
-- Optional asset addresses and price units are correct.
-- The intended treasury and admin addresses are secure.
+Use a fork or other controlled test environment to validate the deployment and configuration sequence. Confirm the target addresses and resulting contract state before sending transactions to a live network.
 
-### 2. Simulate core deployment
+### 3. Deploy only when explicitly required
 
-With the environment loaded, run the script **without** `--broadcast` first:
+The following is a general Foundry command pattern, not an instruction to deploy the already deployed mainnet system:
 
 ```bash
 forge script script/Deploy.s.sol:Deploy \
   --rpc-url "$RH_RPC_URL" \
-  --chain-id 46630 \
-  -vvvv
+  --broadcast
 ```
 
-This command is an example for testnet. For mainnet, use the verified mainnet RPC and chain ID `4663` only after the production checklist has been completed. Do not add `--broadcast` until you have reviewed the simulation output and explicitly intend to send transactions.
+Check the actual script contract name and required environment variables before use. Do not copy and execute a deployment command without reviewing its effects.
 
-### 3. Broadcast the core deployment only when approved
+### 4. Configure an existing adapter
 
-After successful simulation and review, a testnet broadcast uses:
+`ConfigureUniswapV4Adapter.s.sol` is intended to configure an adapter that already exists at the supplied address. It is not a reason to deploy a second adapter.
 
-```bash
-forge script script/Deploy.s.sol:Deploy \
-  --rpc-url "$RH_RPC_URL" \
-  --broadcast \
-  --chain-id 46630 \
-  -vvvv
-```
+Before any configuration transaction, verify:
 
-This is a real transaction when the RPC is testnet. For mainnet, substitute the verified mainnet endpoint and chain ID `4663` only after all production checks are complete. Save emitted contract addresses and transaction hashes in the deployment record.
+- The adapter address and PoolManager.
+- The factory address and caller authorization.
+- The exact pool keys, including fee, tick spacing, and hooks.
+- Pool initialization and liquidity.
+- Whether the target factory's router is already configured.
 
-### 4. Configure the Uniswap V4 adapter
+The current mainnet factory router is already configured. Do not rerun router-configuration transactions against it without an approved migration plan.
 
-The adapter configuration scripts assume specific factory, PoolManager, USDG, and NVDA addresses. The combined script also assumes fee `100`, tick spacing `1`, and zero hooks for the USDG/NVDA pool.
+### 5. Update prices
 
-These are **script parameters, not proof of an existing usable pool**. Before running these scripts against mainnet, verify the actual V4 pool key, currencies, fee, tick spacing, hook address, initialization, liquidity, and intended price impact. If verified pool parameters differ, do not run the script unchanged.
+`UpdatePricesFromV4.s.sol` reads configured Uniswap V4 `slot0` spot state and submits prices to the factory. It is not a TWAP oracle.
 
-The combined script is intended to deploy the adapter, authorize the factory as a caller, register the assumed pool, and set the factory router. The standalone configuration script requires an adapter that already exists on the target network. Do not run both scripts blindly: they expect the factory router to be unset, and the standalone script will fail if the specified adapter does not exist.
+Before running the updater, verify the RPC, factory address, registered pool keys, token ordering, price direction, decimals, and configured safety bounds. Check the resulting on-chain prices and timestamps after execution.
 
-A fresh fork starts from the selected live-chain state; it does not preserve state changes from a separate prior fork simulation. A simulation can predict deployment and configuration behavior, but it does not persist changes to the real chain.
+### 6. Verify registered pools
 
-### 5. Complete post-deployment configuration
-
-Before creating a vault:
-
-1. Verify the factory's stablecoin, super-admin, and router addresses.
-2. Verify the adapter's `PoolManager`, admin, authorized callers, and registered pool keys.
-3. Verify every required pool is initialized and has sufficient liquidity.
-4. Register the intended asset addresses and activate them as needed.
-5. Set and verify prices for every non-stablecoin asset.
-6. Establish a price keeper/monitoring process. The documented default maximum price age is one day.
-7. Allowlist only intended vault creators.
-8. Configure vault managers and per-vault operator permissions deliberately.
-9. Follow the project's documented stablecoin-slot convention for each production vault.
-10. Test genesis, deposit, swap, rebalance, redeem, in-kind exit, and recovery paths in an appropriate non-production environment.
-
-If the core deployment initially uses a hot EOA as super-admin, the mainnet review recommends transferring admin control to a secure multisig before accepting user deposits. Use the two-step `setSuperAdmin` / `acceptSuperAdmin` flow.
+`CheckRegisteredPools.s.sol` is available to inspect the registered pool configuration. Review its expected environment variables and checks before running it. A successful configuration check does not guarantee that the pools have enough liquidity for a specific trade.
 
 ## Post-deployment verification
 
-Do not rely only on console output. Independently read state from deployed contracts and verify:
+Use read-only calls first. These examples query the deployed factory:
 
-- The factory is deployed at the recorded address on the expected chain.
-- `superAdmin()`, `treasury()`, `usdcToken()`, and `router()` match the deployment record.
-- The router points to the intended adapter.
-- The adapter uses the expected Uniswap V4 `PoolManager`.
-- The factory is an authorized adapter caller.
-- Every registered pool key matches the verified live pool configuration.
-- Every required pool is initialized and has enough liquidity for expected trade sizes.
-- Asset prices are present, use the intended units, and are fresh.
-- Creator and manager permissions are correct.
-- Controlled end-to-end tests succeed in the intended test environment.
+```bash
+export RH_RPC_URL="https://rpc.mainnet.chain.robinhood.com"
+export FACTORY_ADDRESS="0x494EcBd1d8df35fb39aD5973Ec0A1598ADF26eA9"
 
-Keep transaction hashes, block numbers, addresses, compiler version, and test results with the deployment record. Never describe a simulated transaction as deployed.
+cast chain-id --rpc-url "$RH_RPC_URL"
 
-### Verified Robinhood Chain Mainnet Adapter Deployment
+cast call "$FACTORY_ADDRESS" "superAdmin()(address)" \
+  --rpc-url "$RH_RPC_URL"
 
-The Uniswap V4 adapter has been deployed and configured on Robinhood Chain mainnet (chain ID `4663`).
+cast call "$FACTORY_ADDRESS" "router()(address)" \
+  --rpc-url "$RH_RPC_URL"
 
-**Deployed configuration**
+cast call "$FACTORY_ADDRESS" "usdcToken()(address)" \
+  --rpc-url "$RH_RPC_URL"
 
-| Item | Value |
+cast call "$FACTORY_ADDRESS" "feeEscrow()(address)" \
+  --rpc-url "$RH_RPC_URL"
+```
+
+The expected values are documented in the mainnet deployment section. If a read fails, check the ABI, function signature, target address, and network before proceeding.
+
+### Verify the adapter
+
+Confirm the adapter's deployed address, PoolManager, registered pool keys, and authorized caller state using the current contract ABI. Do not infer authorization or pool initialization solely from a deployment transaction receipt.
+
+### Verify prices
+
+Check the registered price values and timestamps using the contract's actual getter signatures. Compare each price against an independently trusted source before relying on it for NAV-sensitive operations.
+
+### Verify the complete vault lifecycle
+
+Before accepting user funds, perform a controlled end-to-end test covering:
+
+1. Vault creation.
+2. Genesis deposit.
+3. Investor deposit and share issuance.
+4. Asset swap.
+5. Rebalance.
+6. Redemption request and settlement.
+7. Stablecoin claim or supported in-kind recovery.
+
+The deployment and unit-test results below do not mean this live sequence has already been completed successfully.
+
+## Deployed Robinhood Chain Mainnet Contracts
+
+The following contracts were deployed and configured on Robinhood Chain mainnet, chain ID `4663`.
+
+### Core contract addresses
+
+| Contract | Address |
 |---|---|
-| `ZenoIndexVault` factory | `0xD00ABbC1d1555a173c5081b2204579b057B05378` |
-| Adapter | `0x1CD3F47e7137761e4c1066273893fbE778BB2Dd7` |
-| PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
-| Configured base token (USDG) | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
-| NVDA token | `0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC` |
-| Pool fee | `100` |
-| Tick spacing | `1` |
-| Hooks | Zero address |
-| Registered pair ID | `0x447bb1000fcf9205e84b0f455d80abde4d02b952066ad172602c5489c949443a` |
+| ZenoIndex Factory | `0x494EcBd1d8df35fb39aD5973Ec0A1598ADF26eA9` |
+| `Vault` implementation | `0xb78A139e2f316527a53673b5F093ceE9566CD1A7` |
+| `AccessMaster` | `0xC3A8aB91f9CC66d789B33FD61674991aDEF3EdF2` |
+| `FeeEscrow` | `0x86867a40Da338dfaF75B8fB1f65bC3cc9Ca3b34F` |
+| `UniswapV4Adapter` | `0x1CD3F47e7137761e4c1066273893fbE778BB2Dd7` |
+| Configured stablecoin (USDG) | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+| Uniswap V4 `PoolManager` | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
 
-**Deployment transactions**
+The following factory reads were verified on-chain and matched the deployment configuration: `feeEscrow()`, `router()`, `superAdmin()`, and `usdcToken()`. Despite the variable name `usdcToken`, this factory is configured to use USDG.
+
+#### Registered assets and latest recorded prices
+
+The asset IDs below follow the registration order reported by the deployment logs. USDG is the stablecoin slot. Prices for the other assets are the values recorded by the last successful price-update batch, not guaranteed current market quotes.
+
+| Asset ID | Symbol | Token address | Last recorded price (USDG per token) |
+|---:|---|---|---:|
+| `0` | USDG | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` | `1.000000` (stablecoin accounting) |
+| `1` | NVDA | `0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC` | `218.236705` |
+| `2` | TSLA | `0x322F0929c4625eD5bAd873c95208D54E1c003b2d` | `363.906007` |
+| `3` | META | `0xc0D6457C16Cc70d6790Dd43521C899C87ce02f35` | `723.526486` |
+| `4` | MU | `0xfF080c8ce2E5feadaCa0Da81314Ae59D232d4afD` | `900.677103` |
+| `5` | SPCX | `0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa` | `146.555189` |
+
+**Price methodology and limitation:** The successful update batch calculated these prices from Uniswap V4 `slot0` spot state. They were not sourced from a TWAP or independently verified market-price feed. These are historical update values. The default maximum price age is one day, so a keeper or other trusted process must refresh prices before they become stale. Price-movement checks do not make spot prices manipulation-resistant.
+
+#### Registered Uniswap V4 pool identifiers
+
+These IDs identify the pool configurations registered in the adapter. Registration alone does not guarantee sufficient liquidity or acceptable execution for a given trade size.
+
+| Pair | Registered pool ID |
+|---|---|
+| USDG / SPCX | `0x8567e70dbf639a618ba5eaf9402743452b93ca45c9bf8b97462407f07d7b7448` |
+| USDG / TSLA | `0x8517f8071ae5b831b738052f12125e8e3d6c158b78728aa44ce3b25e5104d32e` |
+| USDG / MU | `0x6fa3ee0048e78bf0a513eb0ab56f482944a767c21db990fcf555605e69f05659` |
+| USDG / META | `0x5875d407a42965b0e768c8925cea290e06fa50603ef34fc99eb92a1050e6ae36` |
+| USDG / NVDA | `0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5` |
+
+#### Deployment and configuration transactions
 
 | Operation | Transaction hash |
 |---|---|
-| Deploy adapter | `0xc5a82c66d9acc0b0b6b329750282a662c2b7fd5226190b3d798fde2e9a89bc2c` |
-| Authorize factory | `0xe591c57f29518498ec24998656b5de805dc215edda131cb1e888459eaa1b5ef7` |
-| Register pool | `0xb9522742cbdfe0778296625252011af9a99cc5cacb1c424d1901f7531bd7d1e0` |
-| Configure factory router | `0x13947a3f8125a65e22109657b4c0015f1b7a5f21f99696642cff2da9aa6a5dda` |
+| Deploy `Vault` implementation | `0x761a4992c15794b787641f8bb8d86d445de9fc143d8541c44d245a31aabf0dd2` |
+| Deploy `AccessMaster` | `0xf4a66295554d634616143bb9f972721708c9a6197f904ff5962cade767f9a1c5` |
+| Deploy new factory | `0x75066cb735c1f3e72b57db039f613187af4b25d559f5dcc540559201470ff6e0` |
+| Deploy `FeeEscrow` | `0xdd57c70d186cf031b8f2370c608a05b528bf9393a48fa58e2e35b38d058165d0` |
+| Register `FeeEscrow` on factory | `0xa915c940d61765274273e5e7d3be049a0768050759431464c4073a65128ba243` |
+| Authorize factory as adapter caller | `0x0a72e761d6db19816c78d53612ea88677e91f82ad5503cf39f233454ecabe561` |
+| Configure factory router | `0x7458c74a34c2a6d55c8d6cef3c24c84adaa5bdd65d16157b3071397ab7f4b570` |
+| Update SPCX price | `0xdafe8f4fcea8e96a140e6fec336a0ab6727c060f8b2159405ed285da39e1969b` |
+| Update TSLA price | `0xcce752ab5923f46a12f29e8c31afb233399b932faf83ba717e9868f8d5f0d80f` |
+| Update MU price | `0xd8b8b300cb262154fbaf389a9c303efdafff6c2cbc2762ffebc9fd5287691ae0` |
+| Update META price | `0x663af87f065e748fe9492ecf6042f571a9a67e0667a172dae9378d9e0aeaf791` |
+| Update NVDA price | `0x218e0f3bc5e2a5792e2028bd55d38d7b5ed8b8d91c7c857bd92fbaa2c55efb6e` |
 
-**Verification status**
+Adapter configuration transactions were confirmed successful. The five asset price-update transactions also completed successfully.
 
-The adapter's deployed bytecode, admin, PoolManager, factory authorization, registered pair, factory router, and configured USDG token were verified through on-chain reads. The USDG/NVDA pool-state inspection also found initialized candidate pools with nonzero liquidity for the inspected configurations.
+#### Verification status
 
-These checks do not prove that an end-to-end vault swap succeeds for a particular trade size. A successful live swap, price impact, and production readiness remain unconfirmed. Run the project's tests and complete an appropriately controlled end-to-end swap test before treating the route as production-ready.
+- Mainnet deployment of the core contracts completed.
+- The adapter was configured, the factory was authorized as an adapter caller, and the factory router was set.
+- Factory reads for `feeEscrow()`, `router()`, `superAdmin()`, and `usdcToken()` were checked on-chain.
+- The latest reported Foundry test run passed **259 tests, with 0 failures and 0 skipped tests**.
+- The complete live vault flow has **not yet been confirmed end to end**. Genesis deposit, investor deposit, swap, rebalance, redemption, and recovery paths still need a controlled end-to-end test before accepting user funds.
+- The price updater currently uses V4 spot state (`slot0`), not a TWAP. Production use needs a documented price source, refresh process, monitoring, and explicit review of price-manipulation risk.
+- The current super-admin is the deployer EOA listed above. The internal review recommends moving privileged control to a secure multisig before production use.
 
-**Network:** Robinhood Chain mainnet
+#### Source control record
 
-**RPC:** `https://rpc.mainnet.chain.robinhood.com`
+- Repository: [`CyreneAI/zenoindex-evm`](https://github.com/CyreneAI/zenoindex-evm)
+- Branch: `feat/zenoindex/phase-1-hardening`
+- Commit: [`e755a31`](https://github.com/CyreneAI/zenoindex-evm/commit/e755a31) — `Harden price updates and add V4 deployment scripts`
+
+**Do not rerun the deployment or router-configuration scripts against this mainnet deployment merely to reproduce the setup.** They can deploy new contracts or fail because the factory router is already configured. Use the addresses documented above for integration and independently verify live state before any further mainnet transaction.
 
 ## Security and operational requirements
 
